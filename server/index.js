@@ -28,7 +28,11 @@ const SCRAPE_TTL_MS = 15 * 60 * 1000
 let scrapeCache = { at: 0, minutes: 0, posts: null }
 let inFlight = null // { minutes, promise } — dedupes concurrent scrapes
 
-async function fetchPosts(minutes, { fresh = false } = {}) {
+// onProgress({ percent, message }) reports scrape progress (0–80% of the whole
+// job; classification takes the remaining 80–100%). onPosts(posts) fires with
+// batches of newly-found posts (fresh scrapes only) so callers can stream
+// results as they arrive.
+async function fetchPosts(minutes, { fresh = false, onProgress = () => {}, onPosts = () => {} } = {}) {
   if (!hasSession()) {
     return { source: 'demo', posts: mockPosts, cached: false }
   }
@@ -38,14 +42,21 @@ async function fetchPosts(minutes, { fresh = false } = {}) {
     scrapeCache.minutes === minutes &&
     Date.now() - scrapeCache.at < SCRAPE_TTL_MS
   if (fresh_enough) {
+    onProgress({ percent: 80, message: '⚡ ใช้ข้อมูลที่ดึงไว้ล่าสุด (cache)' })
     return { source: 'live', posts: scrapeCache.posts, cached: true }
   }
   // If a scrape for this window is already running (e.g. StrictMode double
   // fetch, or two browser tabs), reuse it instead of launching another.
   if (!fresh && inFlight && inFlight.minutes === minutes) {
+    onProgress({ percent: 40, message: '⏳ รอผลการดึงที่กำลังทำอยู่...' })
     return { source: 'live', posts: await inFlight.promise, cached: true }
   }
-  const promise = scrapeGroups(loadGroups(), minutes)
+  const promise = scrapeGroups(
+    loadGroups(),
+    minutes,
+    (p) => onProgress({ percent: Math.round(p.percent * 0.8), message: p.message }),
+    onPosts,
+  )
   inFlight = { minutes, promise }
   try {
     const posts = await promise
@@ -164,23 +175,36 @@ async function callGemini(batch) {
 // mode: 'keyword' = rules only (fast, no AI). 'ai' = Gemini in parallel
 // batches (one big call is slow and truncates). Returns { leads, classifier }.
 const AI_BATCH = 15
-async function classifyPosts(posts, mode = 'ai') {
+async function classifyPosts(posts, mode = 'ai', onProgress = () => {}) {
   if (mode === 'keyword' || !GEMINI_KEY || posts.length === 0) {
+    onProgress({ percent: 95, message: `⚡ คัดกรอง ${posts.length} โพสต์ด้วย Keyword...` })
     return { leads: posts.map((p) => keywordFallback(p)), classifier: 'keyword' }
   }
 
   // Split into small batches and classify them concurrently.
   const batches = []
   for (let i = 0; i < posts.length; i += AI_BATCH) batches.push(posts.slice(i, i + AI_BATCH))
+  onProgress({ percent: 82, message: `🤖 คัดกรอง ${posts.length} โพสต์ด้วย Gemini (${batches.length} ชุด)...` })
 
   let failed = 0
+  let done = 0
   const settled = await Promise.all(
     batches.map((b) =>
-      callGemini(b).catch((err) => {
-        console.warn('⚠️  Gemini batch failed, keyword fallback for it:', err.message)
-        failed++
-        return null // signal fallback for this batch
-      }),
+      callGemini(b)
+        .then((r) => {
+          done++
+          onProgress({
+            percent: 82 + Math.round((done / batches.length) * 17),
+            message: `🤖 คัดกรอง AI... (${done}/${batches.length} ชุด)`,
+          })
+          return r
+        })
+        .catch((err) => {
+          console.warn('⚠️  Gemini batch failed, keyword fallback for it:', err.message)
+          failed++
+          done++
+          return null // signal fallback for this batch
+        }),
     ),
   )
 
@@ -250,6 +274,60 @@ app.get('/api/leads', async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: err.message })
+  }
+})
+
+// Same as /api/leads but streams live progress via Server-Sent Events.
+// Emits: `progress` {percent, message}, then `done` {…leads} or `fail` {error}.
+app.get('/api/leads/stream', async (req, res) => {
+  const minutes = Math.min(parseInt(req.query.minutes, 10) || 60, 24 * 60)
+  const mode = req.query.mode === 'keyword' ? 'keyword' : 'ai'
+  const fresh = req.query.fresh === '1'
+
+  res.setHeader('Content-Type', 'text/event-stream')
+  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Connection', 'keep-alive')
+  res.setHeader('X-Accel-Buffering', 'no') // disable proxy buffering
+  res.flushHeaders?.()
+
+  const send = (event, data) => {
+    res.write(`event: ${event}\n`)
+    res.write(`data: ${JSON.stringify(data)}\n\n`)
+  }
+  const onProgress = (evt) => send('progress', evt)
+
+  try {
+    send('progress', { percent: 0, message: '⏳ เริ่มต้น...' })
+
+    let total = 0
+    let lastClassifier = mode === 'keyword' ? 'keyword' : 'ai'
+    // Classify each batch of freshly-scraped posts and stream it so cards show
+    // up gradually instead of only at the very end.
+    const onPosts = async (batch) => {
+      if (!batch.length) return
+      const { leads, classifier } = await classifyPosts(batch, mode)
+      lastClassifier = classifier
+      total += leads.length
+      send('leads', { leads, classifier })
+    }
+
+    const { source, posts, cached } = await fetchPosts(minutes, { fresh, onProgress, onPosts })
+
+    // Cached / demo paths don't fire onGroup — classify and send once here.
+    if (cached || source === 'demo') {
+      const { leads, classifier } = await classifyPosts(posts, mode, onProgress)
+      lastClassifier = classifier
+      total = leads.length
+      send('leads', { leads, classifier })
+    }
+
+    send('progress', { percent: 100, message: `✅ เสร็จสิ้น · ${total} โพสต์` })
+    send('done', { source, mode, classifier: lastClassifier, cached, count: total, minutes })
+  } catch (err) {
+    console.error(err)
+    send('fail', { error: err.message })
+  } finally {
+    res.end()
   }
 })
 

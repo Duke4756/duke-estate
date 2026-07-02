@@ -12,6 +12,38 @@ export async function fetchLeads({ minutes = 60, mode = 'ai', fresh = false } = 
   return res.json()
 }
 
+// Streams the scrape+classify with live progress via SSE.
+// Returns the EventSource so the caller can .close() it (e.g. on re-run).
+export function streamLeads({ minutes = 60, mode = 'ai', fresh = false } = {}, handlers = {}) {
+  const { onProgress, onLeads, onDone, onError } = handlers
+  const es = new EventSource(
+    `/api/leads/stream?minutes=${minutes}&mode=${mode}${fresh ? '&fresh=1' : ''}`,
+  )
+  es.addEventListener('progress', (e) => onProgress?.(JSON.parse(e.data)))
+  es.addEventListener('leads', (e) => onLeads?.(JSON.parse(e.data)))
+  es.addEventListener('done', (e) => {
+    es.close()
+    onDone?.(JSON.parse(e.data))
+  })
+  es.addEventListener('fail', (e) => {
+    es.close()
+    let msg = 'เกิดข้อผิดพลาด'
+    try {
+      msg = JSON.parse(e.data).error
+    } catch {
+      /* keep default */
+    }
+    onError?.(msg)
+  })
+  // Native connection error (server unreachable, not our `fail` event).
+  es.onerror = () => {
+    if (es.readyState === EventSource.CLOSED) return
+    es.close()
+    onError?.('การเชื่อมต่อกับเซิร์ฟเวอร์ขาด')
+  }
+  return es
+}
+
 export async function getGroups() {
   const res = await fetch('/api/groups')
   if (!res.ok) throw new Error(`Request failed (${res.status})`)

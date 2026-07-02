@@ -1,11 +1,12 @@
-import { useEffect, useMemo, useState } from 'react'
-import { fetchLeads } from './api'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { streamLeads } from './api'
 import Header from './components/Header'
 import StatsBar from './components/StatsBar'
 import FilterTabs from './components/FilterTabs'
 import ModeToggle from './components/ModeToggle'
 import WindowSelect from './components/WindowSelect'
 import GroupsModal from './components/GroupsModal'
+import ProgressBar from './components/ProgressBar'
 import LeadCard from './components/LeadCard'
 import EmptyState from './components/EmptyState'
 
@@ -21,28 +22,56 @@ export default function App() {
   const [minutes, setMinutes] = useState(180) // ช่วงเวลาที่ดึง (นาที)
   const [classifier, setClassifier] = useState(null)
   const [showGroups, setShowGroups] = useState(false)
+  const [percent, setPercent] = useState(0)
+  const [logs, setLogs] = useState([])
+  const esRef = useRef(null)
 
   // fresh=true re-scrapes Facebook; false reuses the server's cached scrape.
-  async function load(fresh = false) {
+  // Streams live progress (percent + log) over SSE.
+  function load(fresh = false) {
+    esRef.current?.close()
     setLoading(true)
     setError(null)
-    try {
-      const data = await fetchLeads({ minutes, mode, fresh })
-      setLeads(data.leads || [])
-      setSource(data.source || 'demo')
-      setClassifier(data.classifier || null)
-      setLastUpdated(new Date().toLocaleTimeString('th-TH'))
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setLoading(false)
-    }
+    setPercent(0)
+    setLogs([])
+    setLeads([]) // clear so cards can stream in fresh
+    esRef.current = streamLeads(
+      { minutes, mode, fresh },
+      {
+        onProgress: ({ percent, message }) => {
+          if (typeof percent === 'number') setPercent(percent)
+          if (message) setLogs((l) => [...l, message].slice(-60))
+        },
+        // Each group's leads arrive here → append (dedupe by id) so posts
+        // show up progressively without waiting for the whole scrape.
+        onLeads: ({ leads, classifier }) => {
+          setLeads((prev) => {
+            const byId = new Map(prev.map((l) => [l.id, l]))
+            for (const l of leads) byId.set(l.id, l)
+            return [...byId.values()]
+          })
+          if (classifier) setClassifier(classifier)
+          setSource('live')
+        },
+        onDone: (data) => {
+          setSource(data.source || 'demo')
+          if (data.classifier) setClassifier(data.classifier)
+          setLastUpdated(new Date().toLocaleTimeString('th-TH'))
+          setLoading(false)
+        },
+        onError: (msg) => {
+          setError(msg)
+          setLoading(false)
+        },
+      },
+    )
   }
 
   // Toggling mode re-classifies the cached scrape (fast). Changing the time
   // window triggers a fresh scrape on the server (cache is keyed by minutes).
   useEffect(() => {
     load(false)
+    return () => esRef.current?.close()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, minutes])
 
@@ -107,21 +136,10 @@ export default function App() {
           )}
         </div>
 
-        {loading ? (
-          <EmptyState
-            icon="⏳"
-            title={
-              mode === 'keyword'
-                ? 'กำลังดึงโพสต์ + คัดกรองด้วย Keyword...'
-                : 'กำลังดึงโพสต์ + วิเคราะห์ด้วย Gemini AI...'
-            }
-          />
-        ) : visible.length === 0 ? (
-          <EmptyState
-            title="ยังไม่มีโพสต์ในหมวดนี้"
-            subtitle="ลองกด “ดึงโพสต์ล่าสุด” อีกครั้ง หรือสลับแท็บ"
-          />
-        ) : (
+        {/* Progress bar shows while loading — but cards below stream in live. */}
+        {loading && <ProgressBar percent={percent} logs={logs} mode={mode} />}
+
+        {visible.length > 0 ? (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {visible
               .slice()
@@ -130,6 +148,13 @@ export default function App() {
                 <LeadCard key={lead.id} lead={lead} />
               ))}
           </div>
+        ) : (
+          !loading && (
+            <EmptyState
+              title="ยังไม่มีโพสต์ในหมวดนี้"
+              subtitle="ลองกด “ดึงโพสต์ล่าสุด” อีกครั้ง หรือสลับแท็บ"
+            />
+          )
         )}
 
         <footer className="pt-4 pb-8 text-center text-[11px] text-slate-400">

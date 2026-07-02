@@ -45,6 +45,13 @@ export default function LeadCard({ lead }) {
   const isLead = lead.category === 'renter'
   const x = lead.extracted || {}
 
+  // Ensure the link goes to Facebook. Older/edge data may hold a relative
+  // href (e.g. "?__cft__=…" or "/stories/…") — resolve it against facebook.com.
+  const rawLink = lead.permalink || ''
+  const postUrl = /^https?:\/\//i.test(rawLink)
+    ? rawLink
+    : 'https://www.facebook.com/' + rawLink.replace(/^\/+/, '')
+
   return (
     <article
       className={`rounded-2xl bg-white border border-slate-200 p-4 ${
@@ -109,7 +116,7 @@ export default function LeadCard({ lead }) {
           </span>
         </div>
         <a
-          href={lead.permalink}
+          href={postUrl}
           target="_blank"
           rel="noreferrer"
           className="text-xs font-semibold text-indigo-600 hover:text-indigo-700"
