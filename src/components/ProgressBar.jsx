@@ -1,4 +1,4 @@
-export default function ProgressBar({ percent = 0, logs = [], mode }) {
+export default function ProgressBar({ percent = 0, logs = [], mode, onStop }) {
   const pct = Math.max(0, Math.min(100, Math.round(percent)))
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-5">
@@ -6,7 +6,17 @@ export default function ProgressBar({ percent = 0, logs = [], mode }) {
         <span className="text-sm font-semibold text-slate-700">
           {mode === 'keyword' ? '⚡ กำลังดึง + คัดกรอง (Keyword)' : '🤖 กำลังดึง + คัดกรอง (AI)'}
         </span>
-        <span className="text-sm font-bold text-indigo-600 tabular-nums">{pct}%</span>
+        <div className="flex items-center gap-3">
+          <span className="text-sm font-bold text-indigo-600 tabular-nums">{pct}%</span>
+          {onStop && (
+            <button
+              onClick={onStop}
+              className="rounded-lg bg-rose-100 px-2.5 py-1 text-xs font-semibold text-rose-600 transition hover:bg-rose-200 active:scale-95"
+            >
+              ⏹ หยุด
+            </button>
+          )}
+        </div>
       </div>
 
       {/* bar */}

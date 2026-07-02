@@ -13,3 +13,6 @@ scratch-debug
 
 # User-edited group list
 server/groups.json
+
+# User-edited keyword list
+server/keywords.json

@@ -4,6 +4,7 @@ import dotenv from 'dotenv'
 import { mockPosts } from '../src/data/mockPosts.js'
 import { scrapeGroups, hasSession } from './scraper.js'
 import { loadGroups, saveGroups, groupLabel } from './groups.js'
+import { loadKeywords, saveKeywords, getDefaults as getDefaultKeywords, loadExtras } from './keywords.js'
 
 dotenv.config()
 
@@ -32,7 +33,7 @@ let inFlight = null // { minutes, promise } — dedupes concurrent scrapes
 // job; classification takes the remaining 80–100%). onPosts(posts) fires with
 // batches of newly-found posts (fresh scrapes only) so callers can stream
 // results as they arrive.
-async function fetchPosts(minutes, { fresh = false, onProgress = () => {}, onPosts = () => {} } = {}) {
+async function fetchPosts(minutes, { fresh = false, onProgress = () => {}, onPosts = () => {}, signal } = {}) {
   if (!hasSession()) {
     return { source: 'demo', posts: mockPosts, cached: false }
   }
@@ -56,6 +57,7 @@ async function fetchPosts(minutes, { fresh = false, onProgress = () => {}, onPos
     minutes,
     (p) => onProgress({ percent: Math.round(p.percent * 0.8), message: p.message }),
     onPosts,
+    signal,
   )
   inFlight = { minutes, promise }
   try {
@@ -223,23 +225,19 @@ async function classifyPosts(posts, mode = 'ai', onProgress = () => {}) {
 }
 
 // Lightweight rule-based fallback (used when no GEMINI_API_KEY is set).
+// Uses the user-customisable keyword list from server/keywords.json.
 function keywordFallback(p) {
   const t = (p.text || '').toLowerCase()
-  // Strong "supply" signals = someone OFFERING a unit (owner/agent). These win
-  // even if the post also contains "หา", because a listing is never a renter.
-  const offersRent =
-    /(ปล่อยเช่า|ให้เช่าเอง|เจ้าของให้เช่า|ให้เช่า|ว่างให้เช่า|นัดชมห้อง|for\s*rent|available\s*for\s*rent|rental\s*@|\/\s*per\s*month|\/เดือน|arrange\s*a?\s*viewing|accept\s*agents)/i.test(
-      t,
-    )
-  // "Demand" signals = someone LOOKING FOR a unit.
-  const wantsRent =
-    /(หา|อยาก|ต้องการ|รับโอน|มองหา|looking\s*for).*(เช่า|ห้องพัก|ห้องนอน|สตูดิโอ|คอนโด|ห้อง|room|condo)/i.test(
-      t,
-    )
-  const sells = /(ขายดาวน์|ขายคอนโด|ขายห้อง|ลงทุน|ผลตอบแทน|สัมมนา|for\s*sale)/i.test(t)
+  const kw = loadKeywords()
+
+  const matchesAny = (list) => list.some((k) => t.includes(k.toLowerCase()))
 
   // Priority: a listing (owner) outranks the word "หา"; sellers next;
   // only then treat a "looking for" post as a renter lead.
+  const offersRent = matchesAny(kw.owner)
+  const sells = matchesAny(kw.seller)
+  const wantsRent = matchesAny(kw.renter)
+
   let category = 'other'
   if (offersRent) category = 'owner'
   else if (sells) category = 'seller'
@@ -255,7 +253,7 @@ function keywordFallback(p) {
     ...p,
     category,
     confidence: category === 'other' ? 0.4 : 0.6,
-    reason: 'ประเมินจากคำสำคัญ (ไม่ได้ตั้งค่า GEMINI_API_KEY)',
+    reason: 'ประเมินจากคำสำคัญ',
     extracted: { location: null, budget, roomType: null, contact },
   }
 }
@@ -290,7 +288,13 @@ app.get('/api/leads/stream', async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no') // disable proxy buffering
   res.flushHeaders?.()
 
+  // Abort signal: fires when the client disconnects (e.g. user clicks Stop).
+  const ac = new AbortController()
+  const { signal } = ac
+  res.on('close', () => ac.abort())
+
   const send = (event, data) => {
+    if (signal.aborted) return
     res.write(`event: ${event}\n`)
     res.write(`data: ${JSON.stringify(data)}\n\n`)
   }
@@ -304,14 +308,16 @@ app.get('/api/leads/stream', async (req, res) => {
     // Classify each batch of freshly-scraped posts and stream it so cards show
     // up gradually instead of only at the very end.
     const onPosts = async (batch) => {
-      if (!batch.length) return
+      if (!batch.length || signal.aborted) return
       const { leads, classifier } = await classifyPosts(batch, mode)
       lastClassifier = classifier
       total += leads.length
       send('leads', { leads, classifier })
     }
 
-    const { source, posts, cached } = await fetchPosts(minutes, { fresh, onProgress, onPosts })
+    const { source, posts, cached } = await fetchPosts(minutes, { fresh, onProgress, onPosts, signal })
+
+    if (signal.aborted) return // client disconnected — stop work
 
     // Cached / demo paths don't fire onGroup — classify and send once here.
     if (cached || source === 'demo') {
@@ -324,6 +330,7 @@ app.get('/api/leads/stream', async (req, res) => {
     send('progress', { percent: 100, message: `✅ เสร็จสิ้น · ${total} โพสต์` })
     send('done', { source, mode, classifier: lastClassifier, cached, count: total, minutes })
   } catch (err) {
+    if (signal.aborted) return // client gone — no point sending fail
     console.error(err)
     send('fail', { error: err.message })
   } finally {
@@ -359,6 +366,32 @@ app.put('/api/groups', (req, res) => {
   scrapeCache = { at: 0, minutes: 0, posts: null } // groups changed → invalidate cache
   console.log(`  📝 อัปเดตกลุ่มเป็น ${saved.length} กลุ่ม: ${saved.map(groupLabel).join(', ')}`)
   res.json({ groups: saved.map((url) => ({ url, label: groupLabel(url) })) })
+})
+
+// ---------------------------------------------------------------------------
+// Keywords CRUD — user-customisable keyword lists for the rule-based classifier
+// ---------------------------------------------------------------------------
+app.get('/api/keywords', (_req, res) => {
+  res.json({
+    defaults: getDefaultKeywords(), // built-ins from keywords.defaults.json (read-only in UI)
+    extras:   loadExtras(),         // user-added extras saved in keywords.json
+    merged:   loadKeywords(),       // defaults + extras merged (what the classifier uses)
+  })
+})
+
+app.put('/api/keywords', (req, res) => {
+  // Body: { extras: { renter, owner, seller } } — only the user-added list
+  const input = req.body?.extras
+  if (!input || typeof input !== 'object') {
+    return res.status(400).json({ error: 'body.extras must be an object with renter/owner/seller arrays' })
+  }
+  try {
+    const saved = saveKeywords(input)
+    console.log(`  📝 อัปเดต keywords extras: renter=${saved.renter.length}, owner=${saved.owner.length}, seller=${saved.seller.length}`)
+    res.json({ extras: saved, merged: loadKeywords() })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
 })
 
 app.listen(PORT, () => {

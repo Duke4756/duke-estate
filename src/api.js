@@ -60,3 +60,20 @@ export async function saveGroups(groups) {
   if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`)
   return body // { groups: [{url, label}] }
 }
+
+export async function getKeywords() {
+  const res = await fetch('/api/keywords')
+  if (!res.ok) throw new Error(`Request failed (${res.status})`)
+  return res.json() // { defaults, extras, merged }
+}
+
+export async function saveKeywordsApi(extras) {
+  const res = await fetch('/api/keywords', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ extras }),
+  })
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`)
+  return body // { extras, merged }
+}

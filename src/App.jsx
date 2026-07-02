@@ -6,6 +6,7 @@ import FilterTabs from './components/FilterTabs'
 import ModeToggle from './components/ModeToggle'
 import WindowSelect from './components/WindowSelect'
 import GroupsModal from './components/GroupsModal'
+import KeywordsModal from './components/KeywordsModal'
 import ProgressBar from './components/ProgressBar'
 import LeadCard from './components/LeadCard'
 import EmptyState from './components/EmptyState'
@@ -22,6 +23,7 @@ export default function App() {
   const [minutes, setMinutes] = useState(180) // ช่วงเวลาที่ดึง (นาที)
   const [classifier, setClassifier] = useState(null)
   const [showGroups, setShowGroups] = useState(false)
+  const [showKeywords, setShowKeywords] = useState(false)
   const [percent, setPercent] = useState(0)
   const [logs, setLogs] = useState([])
   const esRef = useRef(null)
@@ -67,6 +69,13 @@ export default function App() {
     )
   }
 
+  function stop() {
+    esRef.current?.close()
+    esRef.current = null
+    setLoading(false)
+    setLogs((l) => [...l, '⏹ หยุดโดยผู้ใช้'])
+  }
+
   // Toggling mode re-classifies the cached scrape (fast). Changing the time
   // window triggers a fresh scrape on the server (cache is keyed by minutes).
   useEffect(() => {
@@ -94,6 +103,7 @@ export default function App() {
       <Header
         source={source}
         onRefresh={() => load(true)}
+        onStop={stop}
         loading={loading}
         lastUpdated={lastUpdated}
       />
@@ -118,6 +128,12 @@ export default function App() {
             >
               ⚙️ กลุ่ม
             </button>
+            <button
+              onClick={() => setShowKeywords(true)}
+              className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-50"
+            >
+              🏷️ Keywords
+            </button>
           </div>
         </div>
 
@@ -137,7 +153,7 @@ export default function App() {
         </div>
 
         {/* Progress bar shows while loading — but cards below stream in live. */}
-        {loading && <ProgressBar percent={percent} logs={logs} mode={mode} />}
+        {loading && <ProgressBar percent={percent} logs={logs} mode={mode} onStop={stop} />}
 
         {visible.length > 0 ? (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -169,6 +185,14 @@ export default function App() {
         onSaved={() => {
           setShowGroups(false)
           load(true) // groups changed → re-scrape
+        }}
+      />
+      <KeywordsModal
+        open={showKeywords}
+        onClose={() => setShowKeywords(false)}
+        onSaved={() => {
+          setShowKeywords(false)
+          load(false) // keywords changed → re-classify (no re-scrape)
         }}
       />
     </div>

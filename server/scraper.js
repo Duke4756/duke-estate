@@ -107,7 +107,7 @@ const TS_FN = (m) => {
   )
 }
 
-async function scrapeOneGroup(context, url, minutes, report = () => {}, onPosts = () => {}) {
+async function scrapeOneGroup(context, url, minutes, report = () => {}, onPosts = () => {}, signal) {
   const label = groupLabel(url)
   const page = await context.newPage()
   // Use the plain feed (NOT ?sorting_setting=CHRONOLOGICAL): the chronological
@@ -128,6 +128,10 @@ async function scrapeOneGroup(context, url, minutes, report = () => {}, onPosts 
     const emitted = new Set()
     const inWindow = (p) => p._mins === null || p._mins <= minutes
     for (let step = 0; step < steps; step++) {
+      if (signal?.aborted) {
+        report(1, `⏹ ${label}: หยุดโดยผู้ใช้`)
+        break
+      }
       const msgEls = await page.$$('[data-ad-comet-preview="message"]')
       for (const msgEl of msgEls) {
         let meta
@@ -238,7 +242,7 @@ export function hasSession() {
 // to the scrape phase; the caller can rescale). onPosts(posts) fires repeatedly
 // with batches of newly-found posts (per scroll step) so callers can stream
 // results as they appear. Both are safe to omit.
-export async function scrapeGroups(groupUrls, minutes, onProgress = () => {}, onPosts = () => {}) {
+export async function scrapeGroups(groupUrls, minutes, onProgress = () => {}, onPosts = () => {}, signal) {
   if (!hasSession()) {
     throw new Error(
       `ยังไม่มี session — รัน "npm run login" ก่อน (จะเซฟไว้ที่ ${SESSION_PATH})`,
@@ -266,6 +270,10 @@ export async function scrapeGroups(groupUrls, minutes, onProgress = () => {}, on
   const all = []
   try {
     for (let i = 0; i < total; i++) {
+      if (signal?.aborted) {
+        onProgress({ percent: 100, message: `⏹ หยุดดึงโพสต์ · ได้ ${all.length} โพสต์ก่อนหยุด` })
+        break
+      }
       const posts = await scrapeOneGroup(
         context,
         groupUrls[i],
@@ -276,6 +284,7 @@ export async function scrapeGroups(groupUrls, minutes, onProgress = () => {}, on
           onProgress({ percent, message })
         },
         onPosts, // stream batches of posts as they're found
+        signal,
       )
       all.push(...posts)
     }

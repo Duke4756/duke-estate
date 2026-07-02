@@ -1,4 +1,4 @@
-export default function Header({ source, onRefresh, loading, lastUpdated }) {
+export default function Header({ source, onRefresh, onStop, loading, lastUpdated }) {
   return (
     <header className="bg-white border-b border-slate-200 sticky top-0 z-10">
       <div className="max-w-6xl mx-auto px-5 py-4 flex items-center justify-between gap-4">
@@ -11,7 +11,7 @@ export default function Header({ source, onRefresh, loading, lastUpdated }) {
               Condo Lead Finder
             </h1>
             <p className="text-xs text-slate-500">
-              AI คัดกรอง “ผู้กำลังหาห้องเช่า” จากกลุ่ม Facebook
+              AI คัดกรอง "ผู้กำลังหาห้องเช่า" จากกลุ่ม Facebook
             </p>
           </div>
         </div>
@@ -29,14 +29,23 @@ export default function Header({ source, onRefresh, loading, lastUpdated }) {
               {source === 'live' ? '● Live (Facebook)' : '● Demo (ข้อมูลตัวอย่าง)'}
             </span>
           </div>
-          <button
-            onClick={onRefresh}
-            disabled={loading}
-            className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-700 disabled:opacity-50"
-          >
-            <span className={loading ? 'animate-spin' : ''}>↻</span>
-            {loading ? 'กำลังดึง...' : 'ดึงโพสต์ล่าสุด'}
-          </button>
+          {loading ? (
+            <button
+              onClick={onStop}
+              className="inline-flex items-center gap-2 rounded-xl bg-rose-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-rose-700 active:scale-95"
+            >
+              <span>⏹</span>
+              หยุดดึง
+            </button>
+          ) : (
+            <button
+              onClick={onRefresh}
+              className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-700 active:scale-95"
+            >
+              <span>↻</span>
+              ดึงโพสต์ล่าสุด
+            </button>
+          )}
         </div>
       </div>
       {lastUpdated && (
