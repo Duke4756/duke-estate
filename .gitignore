@@ -1,0 +1,15 @@
+node_modules
+dist
+.env
+.DS_Store
+*.log
+
+# Python virtualenv leftover
+.venv
+
+# Facebook login session (contains cookies — never commit)
+server/fb-session.json
+scratch-debug
+
+# User-edited group list
+server/groups.json

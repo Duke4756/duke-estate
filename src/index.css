@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+:root {
+  font-family: "Inter", "Noto Sans Thai", system-ui, -apple-system, sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #f1f5f9;
+}
