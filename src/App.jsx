@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { streamLeads } from './api'
+import { streamLeads, getHistoryRound } from './api'
 import Header from './components/Header'
 import StatsBar from './components/StatsBar'
 import FilterTabs from './components/FilterTabs'
@@ -7,6 +7,7 @@ import ModeToggle from './components/ModeToggle'
 import WindowSelect from './components/WindowSelect'
 import GroupsModal from './components/GroupsModal'
 import KeywordsModal from './components/KeywordsModal'
+import HistoryModal from './components/HistoryModal'
 import ProgressBar from './components/ProgressBar'
 import LeadCard from './components/LeadCard'
 import EmptyState from './components/EmptyState'
@@ -24,6 +25,8 @@ export default function App() {
   const [classifier, setClassifier] = useState(null)
   const [showGroups, setShowGroups] = useState(false)
   const [showKeywords, setShowKeywords] = useState(false)
+  const [showHistory, setShowHistory] = useState(false)
+  const [viewingRound, setViewingRound] = useState(null) // history meta when reviewing a past round
   const [percent, setPercent] = useState(0)
   const [logs, setLogs] = useState([])
   const esRef = useRef(null)
@@ -32,6 +35,7 @@ export default function App() {
   // Streams live progress (percent + log) over SSE.
   function load(fresh = false) {
     esRef.current?.close()
+    setViewingRound(null) // going live exits any history view
     setLoading(true)
     setError(null)
     setPercent(0)
@@ -74,6 +78,23 @@ export default function App() {
     esRef.current = null
     setLoading(false)
     setLogs((l) => [...l, '⏹ หยุดโดยผู้ใช้'])
+  }
+
+  // Load a past search round from history into the main view.
+  async function openRound(id) {
+    try {
+      esRef.current?.close()
+      const r = await getHistoryRound(id)
+      setLoading(false)
+      setLeads(r.leads || [])
+      setClassifier(r.meta?.classifier || null)
+      setViewingRound(r.meta || { id })
+      setSource('history')
+      setShowHistory(false)
+      setError(null)
+    } catch (e) {
+      setError(e.message)
+    }
   }
 
   // Toggling mode re-classifies the cached scrape (fast). Changing the time
@@ -134,8 +155,37 @@ export default function App() {
             >
               🏷️ Keywords
             </button>
+            <button
+              onClick={() => setShowHistory(true)}
+              className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-50"
+            >
+              🕘 History
+            </button>
           </div>
         </div>
+
+        {viewingRound && (
+          <div className="flex items-center justify-between gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-800">
+            <span>
+              📖 กำลังดูประวัติ:{' '}
+              <span className="font-semibold">
+                {new Date(viewingRound.savedAt).toLocaleString('th-TH', {
+                  day: '2-digit',
+                  month: 'short',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                })}
+              </span>{' '}
+              ({viewingRound.total} โพสต์)
+            </span>
+            <button
+              onClick={() => load(false)}
+              className="shrink-0 rounded-lg bg-amber-200/70 px-3 py-1 text-xs font-semibold text-amber-800 hover:bg-amber-200"
+            >
+              ← กลับสู่ live
+            </button>
+          </div>
+        )}
 
         <div className="flex items-center justify-between gap-3 flex-wrap -mt-2">
           <p className="text-xs text-slate-400">
@@ -194,6 +244,11 @@ export default function App() {
           setShowKeywords(false)
           load(false) // keywords changed → re-classify (no re-scrape)
         }}
+      />
+      <HistoryModal
+        open={showHistory}
+        onClose={() => setShowHistory(false)}
+        onOpenRound={openRound}
       />
     </div>
   )

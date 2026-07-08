@@ -1,3 +1,24 @@
+// ── History (past search rounds, stored as Excel on the backend) ──────────
+export async function getHistory() {
+  const res = await fetch('/api/history')
+  if (!res.ok) throw new Error(`Request failed (${res.status})`)
+  return res.json() // { rounds: [...] }
+}
+
+export async function getHistoryRound(id) {
+  const res = await fetch(`/api/history/${id}`)
+  if (!res.ok) throw new Error(`Request failed (${res.status})`)
+  return res.json() // { meta, leads }
+}
+
+export async function deleteHistoryRound(id) {
+  const res = await fetch(`/api/history/${id}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`Request failed (${res.status})`)
+  return res.json()
+}
+
+export const historyExcelUrl = (id) => `/api/history/${id}/excel`
+
 // Calls the backend, which scrapes posts and classifies them.
 // mode: 'keyword' (fast, rules only) or 'ai' (Gemini).
 // fresh: true forces a re-scrape; false reuses the cached scrape (instant).

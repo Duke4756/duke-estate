@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { getGroups, saveGroups } from '../api'
 
 export default function GroupsModal({ open, onClose, onSaved }) {
-  const [urls, setUrls] = useState([])
+  const [items, setItems] = useState([]) // [{ url, active }]
   const [draft, setDraft] = useState('')
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -13,7 +13,7 @@ export default function GroupsModal({ open, onClose, onSaved }) {
     setError(null)
     setLoading(true)
     getGroups()
-      .then((d) => setUrls((d.groups || []).map((g) => g.url)))
+      .then((d) => setItems((d.groups || []).map((g) => ({ url: g.url, active: g.active !== false }))))
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
   }, [open])
@@ -21,6 +21,7 @@ export default function GroupsModal({ open, onClose, onSaved }) {
   if (!open) return null
 
   const labelOf = (u) => (u.match(/groups\/([^/?]+)/) || [])[1] || u
+  const activeCount = items.filter((g) => g.active).length
 
   function addDraft() {
     const v = draft.trim()
@@ -29,21 +30,25 @@ export default function GroupsModal({ open, onClose, onSaved }) {
       setError('ต้องเป็นลิงก์กลุ่ม Facebook เช่น https://www.facebook.com/groups/xxxx')
       return
     }
-    if (urls.includes(v)) {
+    if (items.some((g) => g.url === v)) {
       setError('มีกลุ่มนี้อยู่แล้ว')
       return
     }
-    setUrls([...urls, v])
+    setItems([...items, { url: v, active: true }])
     setDraft('')
     setError(null)
+  }
+
+  function toggle(url) {
+    setItems(items.map((g) => (g.url === url ? { ...g, active: !g.active } : g)))
   }
 
   async function handleSave() {
     setSaving(true)
     setError(null)
     try {
-      const res = await saveGroups(urls)
-      onSaved((res.groups || []).map((g) => g.url))
+      const res = await saveGroups(items)
+      onSaved(res.groups || [])
     } catch (e) {
       setError(e.message)
     } finally {
@@ -69,31 +74,49 @@ export default function GroupsModal({ open, onClose, onSaved }) {
 
         <div className="px-5 py-4 space-y-3">
           <p className="text-xs text-slate-400">
-            เพิ่มหรือลบกลุ่มที่ต้องการมอนิเตอร์ — ยิ่งหลายกลุ่ม การดึงยิ่งใช้เวลานานขึ้น
+            เปิด/ปิดกลุ่มเพื่อเลือกดึงชั่วคราวโดยไม่ต้องลบ — เฉพาะกลุ่มที่ <b>เปิด</b> เท่านั้นที่จะถูกดึง
           </p>
 
           {loading ? (
             <p className="text-sm text-slate-400 py-4 text-center">กำลังโหลด...</p>
           ) : (
             <ul className="space-y-2 max-h-64 overflow-auto">
-              {urls.length === 0 && (
+              {items.length === 0 && (
                 <li className="text-sm text-slate-400 py-3 text-center">ยังไม่มีกลุ่ม</li>
               )}
-              {urls.map((u) => (
+              {items.map((g) => (
                 <li
-                  key={u}
-                  className="flex items-center justify-between gap-2 rounded-xl bg-slate-50 border border-slate-200 px-3 py-2"
+                  key={g.url}
+                  className={`flex items-center justify-between gap-2 rounded-xl border px-3 py-2 transition ${
+                    g.active ? 'bg-slate-50 border-slate-200' : 'bg-slate-50/40 border-slate-200/60'
+                  }`}
                 >
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium text-slate-700">📁 {labelOf(u)}</p>
-                    <p className="text-[11px] text-slate-400 truncate">{u}</p>
+                  <div className={`min-w-0 ${g.active ? '' : 'opacity-45'}`}>
+                    <p className="text-sm font-medium text-slate-700">📁 {labelOf(g.url)}</p>
+                    <p className="text-[11px] text-slate-400 truncate">{g.url}</p>
                   </div>
-                  <button
-                    onClick={() => setUrls(urls.filter((x) => x !== u))}
-                    className="shrink-0 rounded-lg px-2 py-1 text-xs font-semibold text-rose-600 hover:bg-rose-50"
-                  >
-                    ลบ
-                  </button>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {/* Active toggle */}
+                    <button
+                      onClick={() => toggle(g.url)}
+                      title={g.active ? 'กำลังใช้งาน — คลิกเพื่อปิด' : 'ปิดอยู่ — คลิกเพื่อเปิด'}
+                      className={`relative h-6 w-11 rounded-full transition ${
+                        g.active ? 'bg-emerald-500' : 'bg-slate-300'
+                      }`}
+                    >
+                      <span
+                        className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all ${
+                          g.active ? 'left-[22px]' : 'left-0.5'
+                        }`}
+                      />
+                    </button>
+                    <button
+                      onClick={() => setItems(items.filter((x) => x.url !== g.url))}
+                      className="rounded-lg px-2 py-1 text-xs font-semibold text-rose-600 hover:bg-rose-50"
+                    >
+                      ลบ
+                    </button>
+                  </div>
                 </li>
               ))}
             </ul>
@@ -123,7 +146,9 @@ export default function GroupsModal({ open, onClose, onSaved }) {
         </div>
 
         <div className="flex items-center justify-between border-t border-slate-100 px-5 py-3">
-          <span className="text-xs text-slate-400">{urls.length} กลุ่ม</span>
+          <span className="text-xs text-slate-400">
+            {items.length} กลุ่ม · ใช้งาน {activeCount}
+          </span>
           <div className="flex gap-2">
             <button
               onClick={onClose}

@@ -1,10 +1,12 @@
+import fs from 'node:fs'
 import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
 import { mockPosts } from '../src/data/mockPosts.js'
 import { scrapeGroups, hasSession } from './scraper.js'
-import { loadGroups, saveGroups, groupLabel } from './groups.js'
+import { loadGroups, loadGroupsFull, saveGroups, groupLabel } from './groups.js'
 import { loadKeywords, saveKeywords, getDefaults as getDefaultKeywords, loadExtras } from './keywords.js'
+import { saveRound, listRounds, getRound, deleteRound, roundFilePath } from './history.js'
 
 dotenv.config()
 
@@ -305,6 +307,7 @@ app.get('/api/leads/stream', async (req, res) => {
 
     let total = 0
     let lastClassifier = mode === 'keyword' ? 'keyword' : 'ai'
+    const allLeads = [] // accumulate for saving this round to history
     // Classify each batch of freshly-scraped posts and stream it so cards show
     // up gradually instead of only at the very end.
     const onPosts = async (batch) => {
@@ -312,6 +315,7 @@ app.get('/api/leads/stream', async (req, res) => {
       const { leads, classifier } = await classifyPosts(batch, mode)
       lastClassifier = classifier
       total += leads.length
+      allLeads.push(...leads)
       send('leads', { leads, classifier })
     }
 
@@ -324,7 +328,22 @@ app.get('/api/leads/stream', async (req, res) => {
       const { leads, classifier } = await classifyPosts(posts, mode, onProgress)
       lastClassifier = classifier
       total = leads.length
+      allLeads.push(...leads)
       send('leads', { leads, classifier })
+    }
+
+    // Save a fresh live search as an Excel round in history (not cached re-views).
+    if (!cached && source === 'live' && allLeads.length) {
+      try {
+        await saveRound(allLeads, {
+          minutes,
+          mode,
+          classifier: lastClassifier,
+          groups: loadGroups().map(groupLabel),
+        })
+      } catch (e) {
+        console.warn('⚠️  history save failed:', e.message)
+      }
     }
 
     send('progress', { percent: 100, message: `✅ เสร็จสิ้น · ${total} โพสต์` })
@@ -350,22 +369,61 @@ app.get('/api/health', (req, res) => {
 
 // List the monitored groups.
 app.get('/api/groups', (req, res) => {
-  res.json({ groups: loadGroups().map((url) => ({ url, label: groupLabel(url) })) })
+  res.json({
+    groups: loadGroupsFull().map((g) => ({ url: g.url, label: groupLabel(g.url), active: g.active })),
+  })
 })
 
-// Replace the monitored-group list. Body: { groups: ["https://facebook.com/groups/..."] }
+// Replace the monitored-group list. Body: { groups: [{url, active}] } (URL
+// strings are also accepted for backward compatibility).
 app.put('/api/groups', (req, res) => {
   const input = Array.isArray(req.body?.groups) ? req.body.groups : null
   if (!input) return res.status(400).json({ error: 'groups must be an array' })
-  const urls = input.map((s) => String(s).trim()).filter(Boolean)
-  const bad = urls.filter((u) => !/facebook\.com\/groups\//i.test(u))
+  const items = input
+    .map((g) => ({
+      url: (typeof g === 'string' ? g : g?.url || '').trim(),
+      active: typeof g === 'object' ? g.active !== false : true,
+    }))
+    .filter((g) => g.url)
+  const bad = items.filter((g) => !/facebook\.com\/groups\//i.test(g.url))
   if (bad.length) {
-    return res.status(400).json({ error: 'ลิงก์กลุ่มไม่ถูกต้อง:\n' + bad.join('\n') })
+    return res.status(400).json({ error: 'ลิงก์กลุ่มไม่ถูกต้อง:\n' + bad.map((g) => g.url).join('\n') })
   }
-  const saved = saveGroups(urls)
+  const saved = saveGroups(items)
   scrapeCache = { at: 0, minutes: 0, posts: null } // groups changed → invalidate cache
-  console.log(`  📝 อัปเดตกลุ่มเป็น ${saved.length} กลุ่ม: ${saved.map(groupLabel).join(', ')}`)
-  res.json({ groups: saved.map((url) => ({ url, label: groupLabel(url) })) })
+  const activeN = saved.filter((g) => g.active).length
+  console.log(`  📝 อัปเดตกลุ่ม: ${saved.length} กลุ่ม (ใช้งาน ${activeN}): ${saved.map((g) => groupLabel(g.url) + (g.active ? '' : '(ปิด)')).join(', ')}`)
+  res.json({ groups: saved.map((g) => ({ url: g.url, label: groupLabel(g.url), active: g.active })) })
+})
+
+// ---------------------------------------------------------------------------
+// History — past search rounds, each stored as a local Excel file
+// ---------------------------------------------------------------------------
+app.get('/api/history', (_req, res) => {
+  res.json({ rounds: listRounds() })
+})
+
+app.get('/api/history/:id', async (req, res) => {
+  try {
+    const round = await getRound(req.params.id)
+    if (!round) return res.status(404).json({ error: 'not found' })
+    res.json(round) // { meta, leads }
+  } catch (err) {
+    console.error('history read failed:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// Download the raw .xlsx of a round.
+app.get('/api/history/:id/excel', (req, res) => {
+  const file = roundFilePath(req.params.id)
+  if (!file) return res.status(404).json({ error: 'not found' })
+  res.download(file)
+})
+
+app.delete('/api/history/:id', (req, res) => {
+  deleteRound(req.params.id)
+  res.json({ ok: true })
 })
 
 // ---------------------------------------------------------------------------
