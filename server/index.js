@@ -7,12 +7,16 @@ import { scrapeGroups, hasSession } from './scraper.js'
 import { loadGroups, loadGroupsFull, saveGroups, groupLabel } from './groups.js'
 import { loadKeywords, saveKeywords, getDefaults as getDefaultKeywords, loadExtras } from './keywords.js'
 import { saveRound, listRounds, getRound, deleteRound, roundFilePath } from './history.js'
+import { listSets, createSet, updateSet, deleteSet, IMAGES_DIR } from './postsets.js'
+import { listSchedules, createSchedule, updateSchedule, deleteSchedule } from './schedules.js'
+import { canPost, runSchedule, isPosting } from './poster.js'
 
 dotenv.config()
 
 const app = express()
 app.use(cors())
-app.use(express.json())
+app.use(express.json({ limit: '50mb' })) // large limit — post-set images arrive as base64
+app.use('/api/postsets/images', express.static(IMAGES_DIR))
 
 const PORT = process.env.PORT || 8787
 const GEMINI_KEY = process.env.GEMINI_API_KEY
@@ -362,6 +366,8 @@ app.get('/api/health', (req, res) => {
     ok: true,
     gemini: Boolean(GEMINI_KEY),
     model: GEMINI_MODEL,
+    hasSession: hasSession(),
+    canPost: canPost(),
     scraper: hasSession() ? 'local (session ready)' : 'demo (no session)',
     groups: loadGroups().map(groupLabel),
   })
@@ -427,6 +433,116 @@ app.delete('/api/history/:id', (req, res) => {
 })
 
 // ---------------------------------------------------------------------------
+// Post Sets — reusable post content (text + images) for auto-posting
+// ---------------------------------------------------------------------------
+app.get('/api/postsets', (_req, res) => {
+  res.json({ postsets: listSets() })
+})
+
+app.post('/api/postsets', (req, res) => {
+  const { name, text, images } = req.body || {}
+  if (!String(text || '').trim() && !(images || []).length) {
+    return res.status(400).json({ error: 'ต้องมีข้อความหรือรูปภาพอย่างน้อยหนึ่งอย่าง' })
+  }
+  res.json({ postset: createSet({ name, text, images }) })
+})
+
+app.put('/api/postsets/:id', (req, res) => {
+  const { name, text, keepImages, newImages } = req.body || {}
+  const updated = updateSet(req.params.id, { name, text, keepImages, newImages })
+  if (!updated) return res.status(404).json({ error: 'not found' })
+  res.json({ postset: updated })
+})
+
+app.delete('/api/postsets/:id', (req, res) => {
+  deleteSet(req.params.id)
+  res.json({ ok: true })
+})
+
+// ---------------------------------------------------------------------------
+// Schedules — plan to auto-post a set to groups at a time (executor is later)
+// ---------------------------------------------------------------------------
+function validGroups(groups) {
+  const urls = (groups || []).map((g) => String(g).trim()).filter(Boolean)
+  const bad = urls.filter((u) => !/facebook\.com\/groups\//i.test(u))
+  return { urls, bad }
+}
+
+app.get('/api/schedules', (_req, res) => {
+  res.json({ schedules: listSchedules() })
+})
+
+app.post('/api/schedules', (req, res) => {
+  const { name, postSetId, groups, runAt } = req.body || {}
+  const { urls, bad } = validGroups(groups)
+  if (bad.length) return res.status(400).json({ error: 'ลิงก์กลุ่มไม่ถูกต้อง:\n' + bad.join('\n') })
+  if (!urls.length) return res.status(400).json({ error: 'ต้องมีกลุ่มเป้าหมายอย่างน้อยหนึ่งกลุ่ม' })
+  if (!postSetId) return res.status(400).json({ error: 'กรุณาเลือกชุดโพสต์' })
+  res.json({ schedule: createSchedule({ name, postSetId, groups: urls, runAt }) })
+})
+
+app.put('/api/schedules/:id', (req, res) => {
+  const patch = { ...req.body }
+  if ('groups' in patch) {
+    const { urls, bad } = validGroups(patch.groups)
+    if (bad.length) return res.status(400).json({ error: 'ลิงก์กลุ่มไม่ถูกต้อง:\n' + bad.join('\n') })
+    patch.groups = urls
+  }
+  const updated = updateSchedule(req.params.id, patch)
+  if (!updated) return res.status(404).json({ error: 'not found' })
+  res.json({ schedule: updated })
+})
+
+app.delete('/api/schedules/:id', (req, res) => {
+  deleteSchedule(req.params.id)
+  res.json({ ok: true })
+})
+
+// Run a schedule NOW (manual "โพสต์เลย"). Streams live progress via SSE — same
+// pattern as /api/leads/stream. (GET, because EventSource can't POST.) Emits:
+// `progress` {message}, then `done` {ok} or `fail` {error}. Per-group results
+// are written onto the schedule as it runs; the UI polls /api/schedules to see
+// them. Only one post run is allowed at a time (poster.js guards this).
+const inflightRuns = new Set() // schedule ids mid-run (manual or auto)
+app.get('/api/schedules/:id/run', async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream')
+  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Connection', 'keep-alive')
+  res.setHeader('X-Accel-Buffering', 'no') // disable proxy buffering
+  res.flushHeaders?.()
+
+  const ac = new AbortController()
+  res.on('close', () => ac.abort())
+  const send = (event, data) => {
+    if (ac.signal.aborted) return
+    res.write(`event: ${event}\n`)
+    res.write(`data: ${JSON.stringify(data)}\n\n`)
+  }
+
+  const id = req.params.id
+  if (!canPost()) {
+    send('fail', { error: 'ยังไม่มี session — รัน "npm run login" ก่อน' })
+    return res.end()
+  }
+  if (inflightRuns.has(id) || isPosting()) {
+    send('fail', { error: 'มีการโพสต์กำลังทำงานอยู่ — รอจนเสร็จ' })
+    return res.end()
+  }
+
+  inflightRuns.add(id)
+  send('progress', { message: '⏳ เริ่มโพสต์...' })
+  try {
+    await runSchedule(id, { onStep: (msg) => send('progress', { message: msg }) })
+    send('done', { ok: true })
+  } catch (e) {
+    send('fail', { error: e.message })
+  } finally {
+    inflightRuns.delete(id)
+    res.end()
+  }
+})
+
+// ---------------------------------------------------------------------------
 // Keywords CRUD — user-customisable keyword lists for the rule-based classifier
 // ---------------------------------------------------------------------------
 app.get('/api/keywords', (_req, res) => {
@@ -457,5 +573,40 @@ app.listen(PORT, () => {
   console.log(`\n  ✅ API ready → http://localhost:${PORT}`)
   console.log(`     Gemini:   ${GEMINI_KEY ? `configured (${GEMINI_MODEL})` : 'NOT set (keyword fallback)'}`)
   console.log(`     Scraper:  ${hasSession() ? 'local Playwright (session พร้อม)' : 'demo data — รัน "npm run login" ก่อน'} · ${groups.length} กลุ่ม`)
+  console.log(`     Poster:   ${canPost() ? 'พร้อมโพสต์ (session พร้อม)' : 'ยังไม่พร้อม — รัน "npm run login" ก่อน'}`)
   console.log(`     Groups:   ${groups.map(groupLabel).join(', ')}\n`)
 })
+
+// ---------------------------------------------------------------------------
+// Auto-post scheduler — every 30s, fire any schedule whose runAt has passed.
+// Only one run at a time (poster.js enforces it via the `running` flag), and we
+// skip schedules already mid-run or while no session exists.
+//
+// Safety: a schedule whose runAt is more than STALE_MS in the past is NOT
+// auto-fired (it's likely stale from a server outage — auto-posting public FB
+// content by surprise is hard to undo). It's left pending with a console
+// warning; the user can still force it via "โพสต์เลย" in the UI.
+// ---------------------------------------------------------------------------
+const STALE_MS = 10 * 60 * 1000 // skip schedules overdue by more than 10 min
+function checkDueSchedules() {
+  if (isPosting() || !canPost()) return
+  const now = Date.now()
+  const due = listSchedules().find((s) => {
+    if (s.status !== 'pending' || inflightRuns.has(s.id)) return false
+    const t = new Date(s.runAt).getTime()
+    if (isNaN(t)) return false
+    if (t > now) return false // not yet
+    if (now - t > STALE_MS) {
+      console.log(`  ⏭️  ข้าม "${s.name}" (${s.id}) — เลยเวลามากเกินไป กด "โพสต์เลย" เพื่อบังคับ`)
+      return false
+    }
+    return true
+  })
+  if (!due) return
+  inflightRuns.add(due.id)
+  console.log(`  ⏰  auto-post: "${due.name}" ถึงเวลาแล้ว → ${due.groups.length} กลุ่ม`)
+  runSchedule(due.id, { onStep: (m) => console.log(`     · ${m}`) })
+    .catch((e) => console.warn(`  ⚠️  auto-post ล้มเหลว (${due.id}):`, e.message))
+    .finally(() => inflightRuns.delete(due.id))
+}
+setInterval(checkDueSchedules, 30_000)

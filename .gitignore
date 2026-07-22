@@ -19,3 +19,6 @@ server/keywords.json
 
 # Local search history (Excel rounds)
 server/history/
+
+# Auto-post data (post sets, images, schedules) — local only, never shared
+server/autopost/
