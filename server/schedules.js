@@ -36,7 +36,7 @@ export function createSchedule({ name, postSetId, groups, runAt }) {
     groups: (groups || []).map((g) => String(g).trim()).filter(Boolean),
     runAt: runAt || new Date().toISOString(),
     status: 'pending', // pending | posting | done | failed | canceled
-    results: [], // [{ group, ok, error, at }] filled by the poster as it runs
+    results: [], // [{ group, ok, error, postUrl, at }] filled by the poster as it runs
     createdAt: new Date().toISOString(),
   }
   const list = read()

@@ -64,8 +64,9 @@ const groupLabel = (url = '') => (url.match(/groups\/([^/?]+)/) || [])[1] || url
 // return the dialog locator if one appears, else null (inline composer).
 async function openComposer(page) {
   // The group composer entry is a div[role="button"] with the placeholder text
-  // (localized): TH "เขียนอะไรบางอย่าง…"/"คุณกำลังคิดอะไรอยู่", EN "Write something…".
-  const promptRe = /เขียนอะไรบางอย่าง|คิดอะไรอยู่|เขียนโพสต์|on your mind|write something/i
+  // (localized): Facebook currently uses several Thai variants, including
+  // "เขียนอะไรสักหน่อย...." in some groups, as well as the English prompt.
+  const promptRe = /เขียนอะไร(?:บางอย่าง|สักหน่อย)|คิดอะไรอยู่|เขียนโพสต์|on your mind|write something/i
   const candidates = [
     page.getByRole('button', { name: promptRe }).first(),
     page.locator('div[role="button"]').filter({ hasText: promptRe }).first(),
@@ -157,9 +158,53 @@ async function attachImages(page, dialog, imagePaths) {
   return true
 }
 
-// Click the Post button and wait for confirmation (dialog closes or success
-// toast appears). Throws on timeout.
-async function submitAndWait(page, dialog) {
+// Return the permalinks currently visible in the group feed.  We capture this
+// before submitting, then look for a new one afterwards: Facebook does not
+// redirect the composer to the newly-created post.
+async function visiblePostLinks(page) {
+  return page.locator('a[href*="/posts/"]').evaluateAll((anchors) =>
+    anchors
+      .map((a) => a.href)
+      .filter((href) => /facebook\.com\/groups\/[^/]+\/posts\/[^/?#]+/i.test(href))
+      .map((href) => href.split('?')[0]),
+  )
+}
+
+// A closed composer is not proof that Facebook accepted the post: it can also
+// close after a validation error or an interrupted upload.  Verify the post in
+// the group feed itself and return its canonical URL.  Prefer the feed card
+// containing our text; a new permalink is a fallback for image-only posts.
+async function findPublishedPost(page, text, linksBefore) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length >= 8)
+  const marker = lines[0] || ''
+
+  // A large photo set can take a while to appear in the group feed after the
+  // composer reports completion, especially on a fresh Facebook session.
+  for (let attempt = 0; attempt < 45; attempt++) {
+    if (marker) {
+      const card = page.locator('[role="article"]').filter({ hasText: marker }).first()
+      if ((await card.count()) > 0) {
+        const link = await card
+          .locator('a[href*="/posts/"]')
+          .first()
+          .getAttribute('href')
+          .catch(() => null)
+        if (link) return new URL(link, page.url()).href.split('?')[0]
+      }
+    }
+    const newLink = (await visiblePostLinks(page).catch(() => [])).find((href) => !linksBefore.has(href))
+    if (newLink) return newLink
+    await page.waitForTimeout(1000)
+  }
+  return null
+}
+
+// Click the Post button, wait for Facebook's UI acknowledgement, then verify
+// that the post actually appeared in the feed.  Returns its permalink only.
+async function submitAndWait(page, dialog, text) {
   const root = dialog || page
   // Do NOT use an instant .count() check — right after attaching images FB
   // re-renders the composer, so the Post button can appear a moment later.
@@ -186,15 +231,43 @@ async function submitAndWait(page, dialog) {
   } catch {
     /* proceed anyway — some layouts never expose aria-disabled */
   }
+  const linksBefore = new Set(await visiblePostLinks(page).catch(() => []))
   await page.waitForTimeout(500)
   await postBtn.click()
 
-  // Success = the composer dialog closes OR a "post shared" toast shows up.
+  // When photos are attached Facebook first shows a full-screen "Posting…"
+  // state.  The old implementation treated an inner dialog closing as success
+  // and closed Chromium while that upload was still running, cancelling it.
+  // Wait for this state to finish before attempting to inspect the feed.
+  const postingState = page.getByText(/^(กำลังโพสต์|Posting)$/i).last()
+  let sawPostingState = false
+  try {
+    await postingState.waitFor({ state: 'visible', timeout: 10000 })
+    sawPostingState = true
+    await postingState.waitFor({ state: 'hidden', timeout: 120000 })
+  } catch (err) {
+    if (sawPostingState) {
+      throw new Error('Facebook ยังโพสต์ไม่เสร็จภายใน 2 นาที — ไม่ปิดเบราว์เซอร์ระหว่างอัปโหลดอีกแล้ว')
+    }
+    // Text/status varies by Facebook layout.  In that case use its normal
+    // completion UI as a fallback, but still require a real feed permalink.
+  }
+
+  // Success UI differs across Facebook layouts; it is only a transition cue,
+  // not our final success criterion.
   const successToast = page.locator('text=/(ถูกแชร์แล้ว|โพสต์ของคุณ|has been shared|we shared your post)/i')
-  const closed = dialog ? dialog.waitFor({ state: 'hidden', timeout: 30000 }).then(() => 'closed') : null
-  const toasted = successToast.first().waitFor({ state: 'visible', timeout: 30000 }).then(() => 'toast')
-  const settled = closed ? await Promise.race([closed, toasted]) : await toasted
-  if (!settled) throw new Error('ไม่ยืนยันได้ว่าโพสต์สำเร็จ (timeout)')
+  if (!sawPostingState) {
+    const closed = dialog ? dialog.waitFor({ state: 'hidden', timeout: 30000 }).then(() => 'closed') : null
+    const toasted = successToast.first().waitFor({ state: 'visible', timeout: 30000 }).then(() => 'toast')
+    const settled = closed ? await Promise.race([closed, toasted]) : await toasted
+    if (!settled) throw new Error('ไม่ยืนยันได้ว่า Facebook รับโพสต์แล้ว (timeout)')
+  }
+
+  const postUrl = await findPublishedPost(page, text, linksBefore)
+  if (!postUrl) {
+    throw new Error('Facebook ปิดหน้าต่างเขียนโพสต์ แต่ไม่พบโพสต์จริงใน feed จึงไม่ยืนยันผล')
+  }
+  return postUrl
 }
 
 // Post one set to one group. Returns { ok, error }. onStep(msg) reports progress.
@@ -230,9 +303,15 @@ async function postToGroup(context, groupUrl, { text, imagePaths }, onStep = () 
     }
 
     onStep(`กดโพสต์ และรอยืนยัน...`)
-    await submitAndWait(page, dialog)
+    const postUrl = await submitAndWait(page, dialog, text)
+    if (DEBUG) {
+      const dir = path.join(process.cwd(), 'scratch-debug')
+      fs.mkdirSync(dir, { recursive: true })
+      await page.screenshot({ path: path.join(dir, `post-success-${label}.png`) })
+      fs.writeFileSync(path.join(dir, `post-success-${label}.html`), await page.content())
+    }
     onStep(`✅ ${label}: โพสต์สำเร็จ`)
-    return { ok: true, error: null }
+    return { ok: true, error: null, postUrl }
   } catch (e) {
     if (DEBUG) {
       const dir = path.join(process.cwd(), 'scratch-debug')
@@ -245,7 +324,7 @@ async function postToGroup(context, groupUrl, { text, imagePaths }, onStep = () 
       }
       console.log(`     [debug] dumped scratch-debug/post-${label}.{png,html}`)
     }
-    return { ok: false, error: e.message }
+    return { ok: false, error: e.message, postUrl: null }
   } finally {
     await page.close()
   }
@@ -285,7 +364,7 @@ export async function runSchedule(scheduleId, { onStep = () => {} } = {}) {
       const group = groups[i]
       onStep(`(${i + 1}/${groups.length}) ${groupLabel(group)}`)
       const res = await postToGroup(context, group, { text, imagePaths }, onStep)
-      results.push({ group, ok: res.ok, error: res.error, at: new Date().toISOString() })
+      results.push({ group, ok: res.ok, error: res.error, postUrl: res.postUrl, at: new Date().toISOString() })
       updateSchedule(scheduleId, { results: [...results] })
 
       // Human-ish pause between groups (skip after the last one).

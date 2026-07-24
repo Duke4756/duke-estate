@@ -167,6 +167,13 @@ function ScheduleRow({ sch, set, canPost, running, onRun, onRepost, onEdit, onDe
   const hasFailures = results.some((r) => !r.ok)
   const isThisRunning = running?.id === sch.id
   const badge = badgeFor(sch)
+  // One schedule may target several groups. Open every successfully verified
+  // permalink from a single user click (usually this is just one link).
+  const postUrls = [...new Set(results.filter((r) => r.ok && r.postUrl).map((r) => r.postUrl))]
+
+  function openPostedLinks() {
+    postUrls.forEach((url) => window.open(url, '_blank', 'noopener,noreferrer'))
+  }
 
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-4">
@@ -230,6 +237,14 @@ function ScheduleRow({ sch, set, canPost, running, onRun, onRepost, onEdit, onDe
           >
             🔁 โพสต์ซ้ำ
           </button>
+          {postUrls.length > 0 && (
+            <button
+              onClick={openPostedLinks}
+              className="rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700 hover:bg-emerald-100"
+            >
+              ↗ เปิดโพสต์{postUrls.length > 1 ? ` (${postUrls.length})` : ''}
+            </button>
+          )}
           <div className="flex gap-1">
             <button
               onClick={onEdit}
@@ -263,6 +278,16 @@ function ScheduleRow({ sch, set, canPost, running, onRun, onRepost, onEdit, onDe
                   {r.ok ? '✓ สำเร็จ' : '✗ ไม่สำเร็จ'}
                 </span>
                 <span className="truncate text-xs text-slate-600">📁 {labelOf(r.group)}</span>
+                {r.ok && r.postUrl && (
+                  <a
+                    href={r.postUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="ml-auto shrink-0 rounded-md bg-indigo-50 px-2 py-1 text-[11px] font-semibold text-indigo-600 hover:bg-indigo-100"
+                  >
+                    ↗ เปิดโพสต์
+                  </a>
+                )}
               </div>
               {!r.ok && r.error && (
                 <p className="mt-1 whitespace-pre-line text-[11px] leading-relaxed text-rose-600">↳ {r.error}</p>
