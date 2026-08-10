@@ -1,0 +1,6 @@
+export const PIPELINE_VERSION = 'property-pipeline-v7-transit'
+export const NORMALIZER_VERSION = 'normalizer-v1'
+export const CLASSIFIER_VERSION = 'intent-rules-v1'
+export const CANDIDATE_VERSION = 'candidates-v6'
+export const PROMPT_VERSION = 'property-extractor-v1'
+export const SCHEMA_VERSION = 'property-extraction-v1'

@@ -10,16 +10,21 @@
 // to dump a screenshot + HTML per group into ./scratch-debug for re-tuning.
 
 import 'dotenv/config'
-import { chromium } from 'playwright'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { launchBrowser } from './browserLauncher.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const SESSION_PATH = process.env.FB_SESSION_PATH || path.join(__dirname, 'fb-session.json')
 const HEADLESS = process.env.HEADLESS !== 'false' // default headless; set HEADLESS=false to watch
 const DEBUG = process.env.DEBUG_SCRAPER === '1'
 const SCROLLS = parseInt(process.env.SCRAPER_SCROLLS, 10) || 6
+const CONCURRENCY = Math.min(6, Math.max(1, parseInt(process.env.SCRAPER_CONCURRENCY, 10) || 3))
+const SCROLL_DISTANCE = Math.max(1500, parseInt(process.env.SCRAPER_SCROLL_DISTANCE, 10) || 4500)
+const SCROLL_WAIT_MS = Math.max(350, parseInt(process.env.SCRAPER_SCROLL_WAIT_MS, 10) || 900)
+const KNOWN_ONLY_STOP_STEPS = Math.max(2, parseInt(process.env.SCRAPER_KNOWN_STOP_STEPS, 10) || 3)
+const HOVER_DATES = process.env.SCRAPER_HOVER_DATES === '1'
 
 function groupLabel(url = '') {
   const m = url.match(/groups\/([^/?]+)/)
@@ -70,11 +75,41 @@ function parseTooltipDate(raw = '') {
   return d
 }
 
+// Timestamp links usually expose an accessible relative time (for example
+// "30 นาที" or "2 h") even when Facebook scrambles the visible characters.
+// Reading that value from the DOM avoids a network/tooltip round-trip for
+// every post. Exact tooltip hovering remains an opt-in compatibility fallback.
+export function parseFacebookDate(raw = '', now = new Date()) {
+  const text = String(raw || '').trim()
+  if (!text) return null
+  const relative = text.toLowerCase().match(
+    /(?:^|\s)(\d+)\s*(นาที|min(?:ute)?s?|ชม\.?|ชั่วโมง|h(?:ou)?r?s?|วัน|d(?:ay)?s?)(?:\s|$)/iu,
+  )
+  if (relative) {
+    const amount = Number(relative[1])
+    const unit = relative[2]
+    const multiplier = /^(?:นาที|min)/iu.test(unit)
+      ? 60_000
+      : /^(?:ชม|ชั่วโมง|h)/iu.test(unit)
+        ? 3_600_000
+        : 86_400_000
+    return new Date(now.getTime() - amount * multiplier)
+  }
+  if (/^(?:เมื่อสักครู่|just now|now)$/iu.test(text)) return new Date(now)
+  return parseTooltipDate(text)
+}
+
 // Pull metadata (author + text) for a message element and its container.
 const META_FN = (m) => {
-  let el = m
-  for (let i = 0; i < 12 && el.parentElement; i++) el = el.parentElement
+  // Stay inside this post. Walking an arbitrary number of parents can escape
+  // the article and accidentally pick a group-navigation link.
+  const el = m.closest('[role="article"]') || m.parentElement
   const text = (m.innerText || '').trim()
+  const messageNodes = Array.from(el.querySelectorAll('[data-ad-comet-preview="message"], [data-ad-preview="message"]'))
+  const sharedTexts = messageNodes
+    .filter((node) => node !== m && !m.contains(node))
+    .map((node) => (node.innerText || '').trim())
+    .filter((value, index, values) => value && value !== text && values.indexOf(value) === index)
   const links = Array.from(el.querySelectorAll('a[href]'))
   // The first /user/ link is usually the avatar (no text); pick the profile
   // link that actually carries the name (in aria-label or visible text).
@@ -90,14 +125,36 @@ const META_FN = (m) => {
   const gid = (hrefs.find((h) => /\/groups\/(\d+)\//.test(h)) || '').match(/\/groups\/(\d+)\//)?.[1] || ''
   const pcb = (hrefs.find((h) => /set=pcb\.(\d+)/.test(h)) || '').match(/set=pcb\.(\d+)/)?.[1] || ''
   // On the plain feed FB exposes a real permalink on the post — grab it directly.
-  const postHref = links.find((l) => /\/posts\/\d+|\/permalink\/\d+/.test(l.getAttribute('href') || ''))?.href || ''
-  return { text, author, gid, pcb, postHref }
+  const postHref = links.find((l) =>
+    /\/posts\/\d+|\/permalink\/\d+|[?&]story_fbid=\d+/.test(l.getAttribute('href') || ''),
+  )?.href || ''
+  const sharedPostHref = links.find((l) => {
+    const href = l.getAttribute('href') || ''
+    return /\/(?:posts|permalink)\/\d+|[?&]story_fbid=\d+/.test(href) && l.href !== postHref && l.closest('[data-ad-comet-preview="message"], [data-ad-preview="message"]') !== m
+  })?.href || ''
+  const storyId = (postHref.match(/[?&]story_fbid=(\d+)/) || [])[1] || ''
+  const timestampLink = links.find((l) => {
+    const h = l.getAttribute('href') || ''
+    return /\/posts\/|\/permalink\/|story_fbid|__cft__/.test(h) && !/\/user\/|\/photo\//.test(h)
+  })
+  const timestampText = timestampLink
+    ? [
+        timestampLink.getAttribute('aria-label'),
+        timestampLink.getAttribute('title'),
+        timestampLink.querySelector('[aria-label]')?.getAttribute('aria-label'),
+        timestampLink.textContent,
+      ].filter(Boolean).join(' | ')
+    : ''
+  const unixTime = timestampLink?.querySelector('[data-utime]')?.getAttribute('data-utime') ||
+    timestampLink?.getAttribute('data-utime') || ''
+  const imageUrls = Array.from(el.querySelectorAll('img[src]')).map((node) => node.src).filter((src) => !/emoji|profile|scontent.*_s\./i.test(src))
+  const videoUrls = Array.from(el.querySelectorAll('video[src], video source[src]')).map((node) => node.src).filter(Boolean)
+  return { text, sharedTexts, sharedPostHref, author, authorUrl: al?.href || '', gid, pcb, postHref, storyId, timestampText, unixTime, imageUrls, videoUrls }
 }
 
 // Find the post's timestamp/permalink link element (to hover for the date).
 const TS_FN = (m) => {
-  let el = m
-  for (let i = 0; i < 12 && el.parentElement; i++) el = el.parentElement
+  const el = m.closest('[role="article"]') || m.parentElement
   const links = Array.from(el.querySelectorAll('a[href]'))
   return (
     links.find((l) => {
@@ -107,9 +164,11 @@ const TS_FN = (m) => {
   )
 }
 
-async function scrapeOneGroup(context, url, minutes, report = () => {}, onPosts = () => {}, signal) {
+async function scrapeOneGroup(context, url, minutes, report = () => {}, onPosts = () => {}, signal, options = {}) {
+  const isKnown = options.isKnown || (() => false)
+  const onDiscovered = options.onDiscovered || (() => {})
   const label = groupLabel(url)
-  const page = await context.newPage()
+  let page = null
   // Use the plain feed (NOT ?sorting_setting=CHRONOLOGICAL): the chronological
   // view triggers FB's obfuscated markup where post permalinks are hidden. The
   // plain feed exposes real /posts/<id> links. We rely on the hovered timestamp
@@ -117,10 +176,29 @@ async function scrapeOneGroup(context, url, minutes, report = () => {}, onPosts 
   const target = url
   // FB virtualizes the feed (drops scrolled-away posts), so we extract after
   // every scroll step and accumulate, instead of once at the end.
-  const steps = Math.min(Math.max(SCROLLS, Math.ceil(minutes / 12)), 40)
+  // Longer historical windows need deeper scrolling, but retain a hard cap so
+  // one difficult group cannot run forever.
+  const baseSteps = Math.min(Math.max(SCROLLS, Math.ceil(minutes / 90)), 120)
+  const steps = Math.min(Math.max(baseSteps, Number(options.depth) || 0), 120)
+  // Facebook does not expose a durable feed cursor. A new page must still
+  // begin at the top, but the persisted per-group depth lets us fast-forward
+  // through the already-covered middle. Always inspect the newest rows and
+  // keep an overlap near the previous frontier so feed insertions/reordering
+  // do not create a blind gap.
+  const resumeDepth = Math.min(steps, Math.max(0, Number(options.resumeDepth) || 0))
+  const RECENT_FULL_STEPS = 5
+  const FRONTIER_OVERLAP_STEPS = 6
+  const fastForwardStart = RECENT_FULL_STEPS
+  const fastForwardEnd = Math.max(fastForwardStart, resumeDepth - FRONTIER_OVERLAP_STEPS)
   const byKey = new Map()
   let unknown = 0
+  let skippedKnown = 0
+  let consecutiveKnownOnlySteps = 0
+  let scannedSteps = 0
   try {
+    // `newPage` can fail if a user cancels a stream or Chromium exits. Keep it
+    // inside this boundary so a browser-engine error never leaks to the UI.
+    page = await context.newPage()
     report(0.05, `📂 เปิดกลุ่ม ${label}...`)
     await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 60000 })
     await page.waitForTimeout(3500)
@@ -128,11 +206,66 @@ async function scrapeOneGroup(context, url, minutes, report = () => {}, onPosts 
     const emitted = new Set()
     const inWindow = (p) => p._mins === null || p._mins <= minutes
     for (let step = 0; step < steps; step++) {
+      const stepNewPosts = []
       if (signal?.aborted) {
         report(1, `⏹ ${label}: หยุดโดยผู้ใช้`)
         break
       }
-      const msgEls = await page.$$('[data-ad-comet-preview="message"]')
+      const fastForwarding = step >= fastForwardStart && step < fastForwardEnd
+      if (fastForwarding) {
+        report(
+          (step + 1) / steps,
+          `⏩ ${label}: ข้ามช่วงที่เคยอ่าน ${step + 1}/${resumeDepth} · ไปต่อจาก checkpoint`,
+        )
+        await page.mouse.wheel(0, 9000)
+        await page.waitForTimeout(650)
+        continue
+      }
+      scannedSteps = step + 1
+      // One top-level feed article = one source post. Selecting the first
+      // message inside each article prevents comments, buttons, menus and
+      // recommended-group UI from entering raw post text.
+      const articles = await page.$$('[role="article"]')
+      const msgEls = []
+      for (const article of articles) {
+        const isNestedArticle = await article.evaluate((node) => Boolean(node.parentElement?.closest('[role="article"]')))
+        if (isNestedArticle) continue
+        const message = await article.$('[data-ad-comet-preview="message"]')
+        if (message) {
+          // Facebook truncates long listings and keeps the price/specification
+          // lines behind "ดูเพิ่มเติม". Expand only the control inside the
+          // source message (not comments or the rest of the article).
+          try {
+            // In some Facebook layouts the control is a sibling of the text
+            // node rather than its child, so search the top-level article.
+            const controls = await article.$$('div[role="button"], span[role="button"], [tabindex="0"]')
+            let expansions = 0
+            for (const control of controls) {
+              const label = await control.evaluate((element) =>
+                (element.textContent || element.getAttribute('aria-label') || '').trim(),
+              )
+              if (/^(?:ดูเพิ่มเติม|see more)$/iu.test(label)) {
+                // Facebook sometimes renders a transparent dialog layer over
+                // this visible control. Force is limited to this harmless
+                // expansion action; it does not bypass login or publishing UI.
+                await control.click({ force: true })
+                await page.waitForTimeout(80)
+                expansions += 1
+                if (expansions >= 3) break
+              }
+            }
+            // Re-select after the click because React commonly replaces the
+            // collapsed message node with a new expanded node.
+            const expandedMessage = await article.$('[data-ad-comet-preview="message"]')
+            if (expandedMessage) msgEls.push(expandedMessage)
+            continue
+          } catch {
+            // A virtualized post can detach while expanding; extraction below
+            // will either read the current text or safely skip that post.
+          }
+          msgEls.push(message)
+        }
+      }
       for (const msgEl of msgEls) {
         let meta
         try {
@@ -142,7 +275,9 @@ async function scrapeOneGroup(context, url, minutes, report = () => {}, onPosts 
         }
         // Strip ALL whitespace for the dedup key so the same post rendered with
         // different line breaks isn't counted twice.
-        const norm = meta.text.replace(/\s+/g, ' ').trim()
+        const sharedText = (meta.sharedTexts || []).join('\n').trim()
+        const completeText = [sharedText, meta.text].filter(Boolean).join('\n')
+        const norm = completeText.replace(/\s+/g, ' ').trim()
         const key = meta.author + '|' + norm.replace(/\s/g, '').slice(0, 60)
         if (!norm || norm.length < 8 || byKey.has(key)) continue
 
@@ -151,12 +286,16 @@ async function scrapeOneGroup(context, url, minutes, report = () => {}, onPosts 
         //   2) built from group id + post id (from a photo attachment)
         //   3) (fallback below) the timestamp link's resolved href
         const clean =
-          (meta.postHref ? meta.postHref.split('?')[0] : '') ||
+          cleanPostUrl(meta.postHref, meta.gid, meta.storyId) ||
           (meta.gid && meta.pcb ? `https://www.facebook.com/groups/${meta.gid}/posts/${meta.pcb}/` : '')
 
-        // Hover the time link to read the real date tooltip.
-        let when = null
-        let permalink = clean || url
+        // Prefer accessible/structured time already delivered over the
+        // internet with the feed. This turns the old O(posts × ~770ms) hover
+        // loop into a local parse. Hovering is available only for diagnostics.
+        let when = Number(meta.unixTime) > 0
+          ? new Date(Number(meta.unixTime) * 1000)
+          : parseFacebookDate(meta.timestampText)
+        let permalink = clean
         try {
           const tsHandle = await msgEl.evaluateHandle(TS_FN)
           const tsEl = tsHandle.asElement()
@@ -164,15 +303,18 @@ async function scrapeOneGroup(context, url, minutes, report = () => {}, onPosts 
             // Use the RESOLVED href (el.href), not getAttribute — the attribute
             // is often relative (e.g. "?__cft__=…"), which would resolve against
             // our own site instead of facebook.com when clicked.
-            if (!clean) permalink = (await tsEl.evaluate((el) => el.href)) || url
-            await page.mouse.move(2, 2)
-            await page.waitForTimeout(120)
-            await tsEl.hover({ timeout: 3000 })
-            await page.waitForTimeout(650)
-            const tip = await page.evaluate(
-              () => document.querySelector('[role="tooltip"]')?.innerText || '',
-            )
-            when = parseTooltipDate(tip)
+            if (!clean) {
+              const timestampHref = await tsEl.evaluate((el) => el.href)
+              permalink = cleanPostUrl(timestampHref, meta.gid)
+            }
+            if (!when && HOVER_DATES) {
+              await tsEl.hover({ timeout: 1500 })
+              await page.waitForTimeout(200)
+              const tip = await page.evaluate(
+                () => document.querySelector('[role="tooltip"]')?.innerText || '',
+              )
+              when = parseFacebookDate(tip)
+            }
           }
         } catch {
           /* hover/extract failed → treat time as unknown */
@@ -183,28 +325,62 @@ async function scrapeOneGroup(context, url, minutes, report = () => {}, onPosts 
         const post = {
           id: permalink + '#' + key.slice(0, 24),
           author: meta.author || 'Unknown',
-          authorUrl: '',
+          authorUrl: meta.authorUrl || '',
           text: meta.text,
+          sharedText,
+          sharedPermalink: cleanPostUrl(meta.sharedPostHref, meta.gid) || meta.sharedPostHref || '',
           createdAt: (when || new Date()).toISOString(),
           permalink,
           group: label,
+          imageCount: meta.imageUrls?.length || 0,
+          videoCount: meta.videoUrls?.length || 0,
+          mediaUrls: [...(meta.imageUrls || []), ...(meta.videoUrls || [])],
           _mins: mins,
         }
+        const known = Boolean(isKnown(post))
+        post._known = known
+        onDiscovered(post, { known, groupUrl: url })
         byKey.set(key, post)
 
         // Emit THIS post immediately (if within the window) so its card shows
         // up the moment it's scraped — one post at a time.
         if (inWindow(post)) {
           emitted.add(key)
-          onPosts([{ ...post, _mins: undefined }])
+          if (known) skippedKnown++
+          else {
+            const publicPost = { ...post }
+            delete publicPost._mins
+            delete publicPost._known
+            stepNewPosts.push(publicPost)
+          }
         }
+      }
+      // Serialize classification/persistence by scroll batch. The previous
+      // fire-and-forget callback could overlap batches and repeat work.
+      if (stepNewPosts.length) await onPosts(stepNewPosts, { groupUrl: url })
+      if (stepNewPosts.length > 0) {
+        consecutiveKnownOnlySteps = 0
+      } else if (msgEls.length > 0) {
+        consecutiveKnownOnlySteps += 1
       }
       report(
         (step + 1) / steps,
-        `📁 ${label}: เลื่อน ${step + 1}/${steps} · เจอ ${byKey.size} โพสต์`,
+        `📁 ${label}: ไล่ย้อนหลัง ${step + 1}/${steps} · เจอ ${byKey.size} · ใหม่ ${stepNewPosts.length}`,
       )
-      await page.mouse.wheel(0, 3000)
-      await page.waitForTimeout(1700)
+      // New group posts normally appear near the top. Once several successive
+      // loaded sections contain only posts already persisted in the database,
+      // walking all the way back to an old checkpoint wastes most of the run.
+      // Stop at this known boundary; if fresh posts keep appearing we continue
+      // normally and still retain the historical frontier overlap.
+      if (step >= 2 && consecutiveKnownOnlySteps >= KNOWN_ONLY_STOP_STEPS) {
+        report(
+          1,
+          `⚡ ${label}: ถึงช่วงโพสต์เดิมแล้ว · หยุดข้าม checkpoint เพื่อประหยัดเวลา`,
+        )
+        break
+      }
+      await page.mouse.wheel(0, SCROLL_DISTANCE)
+      await page.waitForTimeout(SCROLL_WAIT_MS)
     }
 
     if (DEBUG) {
@@ -219,19 +395,37 @@ async function scrapeOneGroup(context, url, minutes, report = () => {}, onPosts 
     // time) since the chronological feed makes them likely-recent.
     const posts = [...byKey.values()]
       .filter((p) => p._mins === null || p._mins <= minutes)
-      .map(({ _mins, ...p }) => p)
+      .filter((p) => !p._known)
+      .map((post) => {
+        const publicPost = { ...post }
+        delete publicPost._mins
+        delete publicPost._known
+        return publicPost
+      })
     console.log(
-      `     · ${label}: ${posts.length} โพสต์ (ใน ${minutes} นาที, เห็นทั้งหมด ${byKey.size}, เวลาไม่ทราบ ${unknown})`,
+      `     · ${label}: ใหม่ ${posts.length} · ข้ามที่เคยดึง ${skippedKnown} (เห็น ${byKey.size}, เวลาไม่ทราบ ${unknown})`,
     )
-    report(1, `✅ ${label}: ${posts.length} โพสต์`)
-    return posts
+    report(1, `✅ ${label}: ใหม่ ${posts.length} · ข้ามซ้ำ ${skippedKnown}`)
+    return { posts, stats: { depth: scannedSteps, resumeDepth, seen: byKey.size, fresh: posts.length, skippedKnown } }
   } catch (e) {
+    const cancelled = signal?.aborted
+    const closed = /target page, context or browser has been closed|browser has been closed/i.test(e.message || '')
     console.warn(`     ⚠️  ${label} ล้มเหลว: ${e.message}`)
-    report(1, `⚠️ ${label} ล้มเหลว`)
-    return []
+    report(1, cancelled ? `⏹ ${label}: หยุดโดยผู้ใช้` : closed ? `⚠️ ${label}: เบราว์เซอร์เชื่อมต่อหลุด — ข้ามกลุ่มนี้` : `⚠️ ${label} ล้มเหลว`)
+    return { posts: [], stats: { depth: steps, resumeDepth, seen: byKey.size, fresh: 0, skippedKnown, failed: true } }
   } finally {
-    await page.close()
+    await page?.close().catch(() => {})
   }
+}
+
+export function cleanPostUrl(rawUrl = '', groupId = '', knownPostId = '') {
+  const raw = String(rawUrl || '')
+  const postMatch = raw.match(/facebook\.com\/groups\/([^/?#]+)\/(?:posts|permalink)\/(\d+)/i)
+  if (postMatch) return `https://www.facebook.com/groups/${postMatch[1]}/posts/${postMatch[2]}/`
+  const storyId = knownPostId || raw.match(/[?&]story_fbid=(\d+)/i)?.[1]
+  const gid = groupId || raw.match(/[?&]id=(\d+)/i)?.[1]
+  if (storyId && gid) return `https://www.facebook.com/groups/${gid}/posts/${storyId}/`
+  return ''
 }
 
 export function hasSession() {
@@ -242,14 +436,14 @@ export function hasSession() {
 // to the scrape phase; the caller can rescale). onPosts(posts) fires repeatedly
 // with batches of newly-found posts (per scroll step) so callers can stream
 // results as they appear. Both are safe to omit.
-export async function scrapeGroups(groupUrls, minutes, onProgress = () => {}, onPosts = () => {}, signal) {
+export async function scrapeGroups(groupUrls, minutes, onProgress = () => {}, onPosts = () => {}, signal, options = {}) {
   if (!hasSession()) {
     throw new Error(
       `ยังไม่มี session — รัน "npm run login" ก่อน (จะเซฟไว้ที่ ${SESSION_PATH})`,
     )
   }
   onProgress({ percent: 1, message: `🚀 เริ่มดึง ${groupUrls.length} กลุ่ม...` })
-  const browser = await chromium.launch({
+  const browser = await launchBrowser({
     headless: HEADLESS,
     args: ['--disable-blink-features=AutomationControlled'],
   })
@@ -257,8 +451,18 @@ export async function scrapeGroups(groupUrls, minutes, onProgress = () => {}, on
     storageState: SESSION_PATH,
     viewport: { width: 1366, height: 900 },
     locale: 'th-TH',
+    serviceWorkers: 'block',
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  })
+  // Search needs HTML/text and GraphQL responses, not the heavy visual assets.
+  // Blocking them substantially reduces transfer and rendering work on every
+  // parallel group page while leaving scripts/XHR/document requests intact.
+  await context.route('**/*', (route) => {
+    const type = route.request().resourceType()
+    return ['image', 'media', 'font'].includes(type)
+      ? route.abort('blockedbyclient')
+      : route.continue()
   })
   // Reduce automation fingerprints so FB serves the normal (non-obfuscated) DOM.
   await context.addInitScript(() => {
@@ -268,34 +472,50 @@ export async function scrapeGroups(groupUrls, minutes, onProgress = () => {}, on
 
   const total = groupUrls.length
   const all = []
+  const progressByGroup = new Map(groupUrls.map((url) => [url, 0]))
+  let nextIndex = 0
   try {
-    for (let i = 0; i < total; i++) {
-      if (signal?.aborted) {
-        onProgress({ percent: 100, message: `⏹ หยุดดึงโพสต์ · ได้ ${all.length} โพสต์ก่อนหยุด` })
-        break
+    const worker = async () => {
+      while (!signal?.aborted) {
+        const i = nextIndex++
+        if (i >= total) return
+        const groupUrl = groupUrls[i]
+        const depth = options.getDepth?.(groupUrl, Math.min(Math.max(SCROLLS, Math.ceil(minutes / 90)), 120))
+        const resumeDepth = options.getResumeDepth?.(groupUrl) || 0
+        options.onGroupStart?.(groupUrl, { depth, resumeDepth })
+        const result = await scrapeOneGroup(
+          context,
+          groupUrl,
+          minutes,
+          (frac, message) => {
+            progressByGroup.set(groupUrl, frac)
+            const completed = [...progressByGroup.values()].reduce((sum, value) => sum + value, 0)
+            onProgress({ percent: Math.round((completed / total) * 100), message })
+          },
+          onPosts,
+          signal,
+          { ...options, depth, resumeDepth },
+        )
+        all.push(...result.posts)
+        options.onGroupComplete?.(groupUrl, result.stats)
       }
-      const posts = await scrapeOneGroup(
-        context,
-        groupUrls[i],
-        minutes,
-        (frac, message) => {
-          // Whole scrape phase spans 0–100 here; group i contributes 1/total.
-          const percent = Math.round(((i + frac) / total) * 100)
-          onProgress({ percent, message })
-        },
-        onPosts, // stream batches of posts as they're found
-        signal,
-      )
-      all.push(...posts)
+    }
+    const workers = Array.from({ length: Math.min(CONCURRENCY, total) }, () => worker())
+    await Promise.all(workers)
+    if (signal?.aborted) {
+      onProgress({ percent: 100, message: `⏹ หยุดดึงโพสต์ · ได้ ${all.length} โพสต์ก่อนหยุด` })
     }
   } finally {
+    // Preserve cookies Facebook refreshed during collection so the saved
+    // primary session remains warm across scraper/browser restarts.
+    await context.storageState({ path: SESSION_PATH }).catch(() => {})
     await browser.close()
   }
   return all
 }
 
 // Allow a quick standalone test:  npm run scrape:test
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const urls = (process.env.FB_GROUP_URLS || 'https://www.facebook.com/groups/condoowner')
     .split(',')
     .map((s) => s.trim())

@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": true,
+    "noImplicitAny": false,
+    "jsx": "react-jsx",
+    "skipLibCheck": true,
+    "types": ["node", "vitest/globals"]
+  },
+  "include": [
+    "server/pipeline/**/*.js",
+    "server/db/**/*.js",
+    "server/routes/**/*.js",
+    "server/adapters/**/*.js",
+    "server/browserLauncher.js",
+    "server/migrations/**/*.js",
+    "src/api.js",
+    "src/components/OwnerDatabaseView.jsx",
+    "src/components/owner/**/*.jsx"
+  ]
+}

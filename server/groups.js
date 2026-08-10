@@ -22,15 +22,46 @@ function envGroups() {
     .map((url) => ({ url, active: true }))
 }
 
+export function groupKey(value = '') {
+  const raw = String(value).trim()
+  try {
+    const url = new URL(raw)
+    if (!/(^|\.)facebook\.com$/i.test(url.hostname)) return raw.toLowerCase()
+    const match = url.pathname.match(/^\/groups\/([^/?#]+)/i)
+    return match ? decodeURIComponent(match[1]).toLowerCase() : raw.toLowerCase()
+  } catch {
+    const match = raw.match(/facebook\.com\/groups\/([^/?#]+)/i)
+    return match ? decodeURIComponent(match[1]).toLowerCase() : raw.toLowerCase()
+  }
+}
+
+export function duplicateGroups(list) {
+  const seen = new Set()
+  const duplicates = []
+  for (const group of list || []) {
+    const url = (typeof group === 'string' ? group : group?.url || '').trim()
+    if (!url) continue
+    const key = groupKey(url)
+    if (seen.has(key)) duplicates.push(url)
+    else seen.add(key)
+  }
+  return duplicates
+}
+
 // Accepts either the new [{url, active}] shape or a legacy array of URL strings.
 function normalize(list) {
   const seen = new Set()
   const out = []
   for (const g of list || []) {
     const url = (typeof g === 'string' ? g : g?.url || '').trim()
-    if (!url || seen.has(url)) continue
-    seen.add(url)
-    out.push({ url, active: typeof g === 'object' ? g.active !== false : true })
+    const key = groupKey(url)
+    if (!url || seen.has(key)) continue
+    seen.add(key)
+    const category = typeof g === 'object' && String(g.category || '').trim()
+      ? String(g.category).trim()
+      : 'general'
+    const name = typeof g === 'object' ? String(g.name || '').trim() : ''
+    out.push({ url, active: typeof g === 'object' ? g.active !== false : true, category, name })
   }
   return out
 }
@@ -52,6 +83,12 @@ export function loadGroupsFull() {
 export function loadGroups() {
   return loadGroupsFull()
     .filter((g) => g.active)
+    .map((g) => g.url)
+}
+
+export function loadGroupsByCategory(category = 'all') {
+  return loadGroupsFull()
+    .filter((g) => g.active && (category === 'all' || g.category === category))
     .map((g) => g.url)
 }
 

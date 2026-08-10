@@ -1,0 +1,12 @@
+[
+  {"text":"ปล่อยเช่าคอนโด 1 ห้องนอน 35 ตร.ม. ค่าเช่า 18,000 บาท/เดือน","intent":"offer_rent","propertyCount":1,"area":35,"rent":18000},
+  {"text":"ขายคอนโด 2 ห้องนอน 60 sqm ราคาขาย 4.5 ล้าน","intent":"offer_sale","propertyCount":1,"area":60,"sale":4500000},
+  {"text":"ขาย 4 ล้าน ปล่อยเช่า 20,000 บาท/เดือน พื้นที่ 42 ตร.ม.","intent":"offer_rent_and_sale","propertyCount":1,"area":42,"rent":20000},
+  {"text":"หาคอนโดเช่า งบไม่เกิน 25,000 บาท ขอเลี้ยงแมว","intent":"wanted_rent","propertyCount":0},
+  {"text":"ต้องการซื้อคอนโด งบ 4 ล้านบาท","intent":"wanted_buy","propertyCount":0},
+  {"text":"รับ co-agent แบ่งคอม ติดต่อ 0812345678","intent":"co_agent_request","propertyCount":0},
+  {"text":"บริการรับทำความสะอาดคอนโด ราคาพิเศษ","intent":"service_or_spam","propertyCount":0},
+  {"text":"ปล่อยเช่า คอนโดเลี้ยงสัตว์ได้ 3 ห้องนอน ทองหล่อ 180 ตร.ม.","intent":"offer_rent","propertyCount":1,"area":180,"rent":null,"project":null},
+  {"text":"ปล่อยเช่า ห้องสตูดิโอ 28 sq.m. ค่าเช่า 15,000 บาท/เดือน","intent":"offer_rent","propertyCount":1,"area":28,"rent":15000,"bedrooms":0},
+  {"text":"ประกาศข่าวประชุมลูกบ้านประจำปี","intent":"other","propertyCount":0}
+]

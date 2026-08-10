@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { createPostSet, updatePostSet } from '../api'
+import { createPostSet, disconnectJsaSession, finishJsaSession, getJsaSession, importPostSetUrl, startJsaSession, updatePostSet } from '../api'
 
 const fileToDataUrl = (file) =>
   new Promise((resolve, reject) => {
@@ -12,35 +12,65 @@ const fileToDataUrl = (file) =>
 export default function PostSetEditor({ open, set, onClose, onSaved }) {
   const [name, setName] = useState('')
   const [text, setText] = useState('')
-  const [existing, setExisting] = useState([]) // [{file, url}] kept from an edited set
-  const [added, setAdded] = useState([]) // [dataUrl] newly picked
+  // A single list is important: it lets new and existing images be rearranged together.
+  const [images, setImages] = useState([]) // [{id, type: 'existing'|'new', file?, url}]
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
+  const [draggingImages, setDraggingImages] = useState(false)
+  const [sourceUrl, setSourceUrl] = useState('')
+  const [importing, setImporting] = useState(false)
+  const [jsaSession, setJsaSession] = useState({ connected: false, loginOpen: false })
+  const [sessionBusy, setSessionBusy] = useState(false)
 
   useEffect(() => {
     if (!open) return
     setName(set?.name || '')
     setText(set?.text || '')
-    setExisting(set?.images || [])
-    setAdded([])
+    setImages((set?.images || []).map((image) => ({
+      id: `existing-${image.file}`,
+      type: 'existing',
+      ...image,
+    })))
     setError(null)
+    setDraggingImages(false)
+    setSourceUrl(set?.sourceUrl || '')
+    getJsaSession().then(setJsaSession).catch(() => {})
   }, [open, set])
 
   if (!open) return null
 
-  async function pickFiles(e) {
-    const files = [...e.target.files]
-    e.target.value = '' // allow re-picking same file
+  async function addFiles(fileList) {
+    const files = [...fileList]
+    const images = files.filter((f) => f.type.startsWith('image/'))
+    if (images.length === 0) {
+      setError('กรุณาเลือกหรือลากวางไฟล์รูปภาพ')
+      return
+    }
     try {
-      const urls = await Promise.all(files.filter((f) => f.type.startsWith('image/')).map(fileToDataUrl))
-      setAdded((a) => [...a, ...urls])
+      const urls = await Promise.all(images.map(fileToDataUrl))
+      setImages((current) => [
+        ...current,
+        ...urls.map((url) => ({ id: `new-${crypto.randomUUID()}`, type: 'new', url })),
+      ])
+      setError(null)
     } catch {
       setError('อ่านไฟล์รูปไม่สำเร็จ')
     }
   }
 
+  function pickFiles(e) {
+    addFiles(e.target.files)
+    e.target.value = '' // allow re-picking same file
+  }
+
+  function dropImages(e) {
+    e.preventDefault()
+    setDraggingImages(false)
+    addFiles(e.dataTransfer.files)
+  }
+
   async function handleSave() {
-    if (!text.trim() && existing.length + added.length === 0) {
+    if (!text.trim() && images.length === 0) {
       setError('ต้องมีข้อความหรือรูปภาพอย่างน้อยหนึ่งอย่าง')
       return
     }
@@ -51,11 +81,18 @@ export default function PostSetEditor({ open, set, onClose, onSaved }) {
         await updatePostSet(set.id, {
           name,
           text,
-          keepImages: existing.map((i) => i.file),
-          newImages: added,
+          keepImages: images.filter((image) => image.type === 'existing').map((image) => image.file),
+          newImages: images
+            .filter((image) => image.type === 'new')
+            .map((image) => ({ id: image.id, url: image.url })),
+          imageOrder: images.map((image) =>
+            image.type === 'existing'
+              ? { type: 'existing', file: image.file }
+              : { type: 'new', id: image.id },
+          ),
         })
       } else {
-        await createPostSet({ name, text, images: added })
+        await createPostSet({ name, text, images: images.map((image) => image.url), sourceUrl })
       }
       onSaved()
     } catch (e) {
@@ -65,7 +102,47 @@ export default function PostSetEditor({ open, set, onClose, onSaved }) {
     }
   }
 
-  const totalImages = existing.length + added.length
+  async function importUrl(value = sourceUrl) {
+    const url = String(value || '').trim()
+    if (!url) return setError('กรุณาวางลิงก์ประกาศจากเว็บไซต์บริษัท')
+    setImporting(true)
+    setError(null)
+    try {
+      const preview = await importPostSetUrl(url)
+      setSourceUrl(preview.sourceUrl)
+      setName(preview.name || '')
+      setText(preview.text || '')
+      setImages((preview.images || []).map((url) => ({ id: `new-${crypto.randomUUID()}`, type: 'new', url })))
+      if (!preview.images?.length) setError('ดึงข้อความสำเร็จ แต่ไม่พบรูปที่ดาวน์โหลดได้ กรุณาเพิ่มรูปด้วยตนเองก่อนบันทึก')
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  async function runSessionAction(action) {
+    setSessionBusy(true)
+    setError(null)
+    try { setJsaSession(await action()) }
+    catch (e) { setError(e.message) }
+    finally { setSessionBusy(false) }
+  }
+
+  const totalImages = images.length
+
+  function moveImage(draggedId, targetId) {
+    if (draggedId === targetId) return
+    setImages((current) => {
+      const from = current.findIndex((image) => image.id === draggedId)
+      const to = current.findIndex((image) => image.id === targetId)
+      if (from < 0 || to < 0) return current
+      const next = [...current]
+      const [dragged] = next.splice(from, 1)
+      next.splice(to, 0, dragged)
+      return next
+    })
+  }
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-slate-900/40 p-4" onClick={onClose}>
@@ -83,6 +160,27 @@ export default function PostSetEditor({ open, set, onClose, onSaved }) {
         </div>
 
         <div className="px-5 py-4 space-y-3 overflow-auto">
+          {!set?.id && <div className="rounded-xl border border-indigo-100 bg-indigo-50/60 p-3">
+            <label className="text-xs font-bold text-indigo-800">นำเข้าจากลิงก์เว็บไซต์บริษัท</label>
+            <div className="mt-2 flex gap-2">
+              <input type="url" value={sourceUrl} onChange={(e) => setSourceUrl(e.target.value)} onPaste={(e) => {
+                const pasted = e.clipboardData.getData('text').trim()
+                if (/^https?:\/\//i.test(pasted)) {
+                  e.preventDefault()
+                  setSourceUrl(pasted)
+                  void importUrl(pasted)
+                }
+              }} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); importUrl() } }} placeholder="https://.../property/..." className="min-w-0 flex-1 rounded-xl border border-indigo-200 bg-white px-3 py-2 text-sm outline-none focus:border-indigo-500" />
+              <button type="button" onClick={importUrl} disabled={importing} className="rounded-xl bg-indigo-600 px-3 py-2 text-sm font-semibold text-white disabled:opacity-50">{importing ? 'กำลังดึง…' : 'ดึงข้อมูล'}</button>
+            </div>
+            <p className="mt-1.5 text-[11px] text-indigo-600">วางลิงก์แล้วระบบจะเริ่มดึงทันที จากนั้นให้ตรวจข้อความและรูปก่อนบันทึกเข้าระบบโพสต์อัตโนมัติ</p>
+            <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-indigo-100 pt-2">
+              <span className={`text-[11px] font-bold ${jsaSession.connected ? 'text-emerald-700' : jsaSession.loginOpen ? 'text-amber-700' : 'text-slate-500'}`}>{jsaSession.connected ? '● เชื่อมต่อ JSA แล้ว' : jsaSession.loginOpen ? '● รอยืนยันการล็อกอิน' : '○ ยังไม่ได้เชื่อมต่อ JSA'}</span>
+              {!jsaSession.loginOpen && <button type="button" disabled={sessionBusy} onClick={() => runSessionAction(() => startJsaSession(sourceUrl || undefined))} className="rounded-lg border border-indigo-200 bg-white px-2 py-1 text-[11px] font-semibold text-indigo-700 disabled:opacity-50">{jsaSession.connected ? 'ล็อกอินใหม่' : 'เชื่อมต่อ JSA'}</button>}
+              {jsaSession.loginOpen && <button type="button" disabled={sessionBusy} onClick={() => runSessionAction(finishJsaSession)} className="rounded-lg bg-emerald-600 px-2 py-1 text-[11px] font-semibold text-white disabled:opacity-50">ล็อกอินแล้ว · บันทึก Session</button>}
+              {jsaSession.connected && <button type="button" disabled={sessionBusy} onClick={() => runSessionAction(disconnectJsaSession)} className="px-1 py-1 text-[11px] text-rose-600 disabled:opacity-50">ยกเลิกการเชื่อมต่อ</button>}
+            </div>
+          </div>}
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -98,36 +196,54 @@ export default function PostSetEditor({ open, set, onClose, onSaved }) {
             className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-indigo-400 resize-y leading-relaxed"
           />
 
-          {/* image thumbnails */}
+          {/* Drag thumbnails to control the order used when posting. */}
           {totalImages > 0 && (
-            <div className="grid grid-cols-4 gap-2">
-              {existing.map((img) => (
-                <div key={img.file} className="relative group aspect-square">
-                  <img src={img.url} alt="" className="w-full h-full object-cover rounded-lg border border-slate-200" />
+            <>
+              <p className="text-xs text-slate-500">ลากรูปเพื่อจัดลำดับ — รูปแรกจะถูกโพสต์ก่อน</p>
+              <div className="grid grid-cols-4 gap-2">
+              {images.map((image, index) => (
+                <div
+                  key={image.id}
+                  draggable
+                  onDragStart={(e) => e.dataTransfer.setData('text/plain', image.id)}
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => {
+                    e.preventDefault()
+                    moveImage(e.dataTransfer.getData('text/plain'), image.id)
+                  }}
+                  className="relative group aspect-square cursor-grab active:cursor-grabbing"
+                >
+                  <img src={image.url} alt={`รูปที่ ${index + 1}`} className={`w-full h-full object-cover rounded-lg border ${image.type === 'new' ? 'border-emerald-300' : 'border-slate-200'}`} />
+                  <span className="absolute left-1 top-1 h-5 min-w-5 rounded-full bg-slate-900/70 px-1 text-xs text-white grid place-items-center">{index + 1}</span>
                   <button
-                    onClick={() => setExisting((x) => x.filter((i) => i.file !== img.file))}
+                    onClick={() => setImages((current) => current.filter((item) => item.id !== image.id))}
+                    draggable={false}
                     className="absolute -top-1.5 -right-1.5 h-5 w-5 rounded-full bg-rose-600 text-white text-xs grid place-items-center shadow"
                   >
                     ✕
                   </button>
                 </div>
               ))}
-              {added.map((d, i) => (
-                <div key={i} className="relative group aspect-square">
-                  <img src={d} alt="" className="w-full h-full object-cover rounded-lg border border-emerald-300" />
-                  <button
-                    onClick={() => setAdded((a) => a.filter((_, j) => j !== i))}
-                    className="absolute -top-1.5 -right-1.5 h-5 w-5 rounded-full bg-rose-600 text-white text-xs grid place-items-center shadow"
-                  >
-                    ✕
-                  </button>
-                </div>
-              ))}
-            </div>
+              </div>
+            </>
           )}
 
-          <label className="flex items-center justify-center gap-2 rounded-xl border-2 border-dashed border-slate-200 py-3 text-sm font-medium text-slate-500 cursor-pointer hover:border-indigo-300 hover:text-indigo-600">
-            🖼️ เพิ่มรูปภาพ
+          <label
+            onDragOver={(e) => {
+              e.preventDefault()
+              setDraggingImages(true)
+            }}
+            onDragLeave={() => setDraggingImages(false)}
+            onDrop={dropImages}
+            className={`flex min-h-24 cursor-pointer flex-col items-center justify-center gap-1.5 rounded-xl border-2 border-dashed px-4 py-3 text-center text-sm font-medium transition-colors ${
+              draggingImages
+                ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
+                : 'border-slate-200 text-slate-500 hover:border-indigo-300 hover:text-indigo-600'
+            }`}
+          >
+            <span className="text-lg">🖼️</span>
+            <span>ลากรูปมาวางที่นี่ หรือคลิกเพื่อเลือกรูป</span>
+            <span className="text-xs font-normal text-slate-400">รองรับหลายรูปพร้อมกัน</span>
             <input type="file" accept="image/*" multiple onChange={pickFiles} className="hidden" />
           </label>
 

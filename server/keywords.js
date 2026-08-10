@@ -29,6 +29,9 @@ export function loadKeywords() {
     if (fs.existsSync(KW_PATH)) {
       const data = JSON.parse(fs.readFileSync(KW_PATH, 'utf8'))
       if (data && typeof data === 'object') {
+        // Current format stores the complete editable list. Keep reading the
+        // old "extras" format so existing users don't lose custom words.
+        if (data.keywords) return normalize(data.keywords)
         // Merge: defaults are always included; user extras are appended & deduped.
         return {
           renter: mergeUnique(defaults.renter, data.renter),
@@ -43,15 +46,11 @@ export function loadKeywords() {
   return { renter: [...defaults.renter], owner: [...defaults.owner], seller: [...defaults.seller] }
 }
 
-// Save only the USER-ADDED extras (not the defaults — those live in the JSON file).
+// Save the complete list edited in the UI. This makes every chip—including a
+// formerly built-in one—editable without modifying a tracked source file.
 export function saveKeywords(data) {
-  const defaults = loadDefaults()
-  const clean = {
-    renter: extraOnly(defaults.renter, data.renter),
-    owner:  extraOnly(defaults.owner,  data.owner),
-    seller: extraOnly(defaults.seller, data.seller),
-  }
-  fs.writeFileSync(KW_PATH, JSON.stringify(clean, null, 2))
+  const clean = normalize(data)
+  fs.writeFileSync(KW_PATH, JSON.stringify({ keywords: clean, updatedAt: new Date().toISOString() }, null, 2))
   return clean
 }
 
@@ -74,6 +73,7 @@ export function loadExtras() {
   try {
     if (fs.existsSync(KW_PATH)) {
       const data = JSON.parse(fs.readFileSync(KW_PATH, 'utf8'))
+      if (data?.keywords) return { renter: [], owner: [], seller: [] }
       if (data && typeof data === 'object') return data
     }
   } catch { /* ignore */ }
@@ -84,6 +84,13 @@ export function loadExtras() {
 function dedupe(arr) {
   if (!Array.isArray(arr)) return []
   return [...new Set(arr.map((s) => String(s).trim().toLowerCase()).filter(Boolean))]
+}
+function normalize(data = {}) {
+  return {
+    renter: dedupe(data.renter),
+    owner: dedupe(data.owner),
+    seller: dedupe(data.seller),
+  }
 }
 function mergeUnique(base, extra) {
   return dedupe([...(base || []), ...(extra || [])])

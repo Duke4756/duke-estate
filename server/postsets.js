@@ -67,13 +67,27 @@ export function getSet(id) {
   return s ? toPublic(s) : null
 }
 
-export function createSet({ name, text, images }) {
+export function normalizeSourceUrl(value = '') {
+  try {
+    const url = new URL(String(value).trim())
+    url.hash = ''
+    return url.href.replace(/\/$/, '')
+  } catch { return String(value).trim() }
+}
+
+export function findSetBySourceUrl(sourceUrl) {
+  const normalized = normalizeSourceUrl(sourceUrl)
+  return normalized ? read().find((set) => normalizeSourceUrl(set.sourceUrl) === normalized) || null : null
+}
+
+export function createSet({ name, text, images, sourceUrl }) {
   const id = 'ps_' + Date.now()
   const set = {
     id,
     name: name?.trim() || 'ชุดโพสต์ใหม่',
     text: text || '',
     images: saveImages(id, images),
+    sourceUrl: normalizeSourceUrl(sourceUrl) || undefined,
     createdAt: new Date().toISOString(),
   }
   const list = read()
@@ -82,8 +96,27 @@ export function createSet({ name, text, images }) {
   return toPublic(set)
 }
 
-// keepImages: existing filenames to keep. newImages: base64 data-URLs to add.
-export function updateSet(id, { name, text, keepImages, newImages }) {
+export function refreshImportedSet(id, { name, text, images, sourceUrl }) {
+  const list = read()
+  const index = list.findIndex((set) => set.id === id)
+  if (index < 0) return null
+  const current = list[index]
+  removeImages(current.images)
+  list[index] = {
+    ...current,
+    name: name?.trim() || current.name,
+    text: text || current.text,
+    images: saveImages(`${id}_${Date.now()}`, images),
+    sourceUrl: normalizeSourceUrl(sourceUrl) || current.sourceUrl,
+    updatedAt: new Date().toISOString(),
+  }
+  write(list)
+  return toPublic(list[index])
+}
+
+// keepImages: existing filenames to keep. newImages: base64 data-URLs (or {id,url}) to add.
+// imageOrder can interleave both types: [{type:'existing', file}, {type:'new', id}].
+export function updateSet(id, { name, text, keepImages, newImages, imageOrder }) {
   const list = read()
   const i = list.findIndex((s) => s.id === id)
   if (i < 0) return null
@@ -92,12 +125,23 @@ export function updateSet(id, { name, text, keepImages, newImages }) {
     ? cur.images.filter((f) => keepImages.includes(f))
     : cur.images
   removeImages(cur.images.filter((f) => !kept.includes(f)))
-  const added = saveImages(id + '_' + Date.now(), newImages)
+  const newItems = Array.isArray(newImages) ? newImages : []
+  const added = saveImages(id + '_' + Date.now(), newItems.map((image) => image?.url || image))
+  const newById = new Map(
+    newItems.map((image, index) => [image?.id, added[index]]),
+  )
+  const ordered = Array.isArray(imageOrder)
+    ? imageOrder.map((image) => {
+        if (image?.type === 'existing') return kept.includes(image.file) ? image.file : null
+        if (image?.type === 'new') return newById.get(image.id) || null
+        return null
+      }).filter(Boolean)
+    : [...kept, ...added]
   list[i] = {
     ...cur,
     name: name != null ? name.trim() || cur.name : cur.name,
     text: text != null ? text : cur.text,
-    images: [...kept, ...added],
+    images: ordered,
     updatedAt: new Date().toISOString(),
   }
   write(list)
@@ -110,4 +154,29 @@ export function deleteSet(id) {
   if (s) removeImages(s.images)
   write(list.filter((x) => x.id !== id))
   return true
+}
+
+export function deleteSets(ids) {
+  const targets = new Set((ids || []).filter(Boolean))
+  if (!targets.size) return []
+  const list = read()
+  const removed = list.filter((set) => targets.has(set.id))
+  removed.forEach((set) => removeImages(set.images))
+  write(list.filter((set) => !targets.has(set.id)))
+  return removed.map((set) => set.id)
+}
+
+export function reorderSets(ids) {
+  const list = read()
+  const byId = new Map(list.map((set) => [set.id, set]))
+  const ordered = []
+  for (const id of ids || []) {
+    const set = byId.get(id)
+    if (!set) continue
+    ordered.push(set)
+    byId.delete(id)
+  }
+  ordered.push(...list.filter((set) => byId.has(set.id)))
+  write(ordered)
+  return ordered.map(toPublic)
 }

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { streamLeads, getHistoryRound, getHealth } from './api'
+import { streamLeads, getHistoryRound, getHealth, extractOwnerListing } from './api'
 import Header from './components/Header'
 import SessionBanner from './components/SessionBanner'
 import StatsBar from './components/StatsBar'
@@ -13,22 +13,38 @@ import ProgressBar from './components/ProgressBar'
 import LeadCard from './components/LeadCard'
 import EmptyState from './components/EmptyState'
 import AutoPostView from './components/AutoPostView'
+import OwnerDatabaseView from './components/OwnerDatabaseView'
+import GroupCrawlHistoryModal from './components/GroupCrawlHistoryModal'
+import OwnerListingReviewQueue from './components/owner/OwnerListingReviewQueue'
+import SettingsView from './components/SettingsView'
+
+const APP_ROLE = import.meta.env.VITE_APP_ROLE || 'all'
 
 export default function App() {
-  const [appMode, setAppMode] = useState('search') // 'search' | 'autopost'
+  const [appMode, setAppMode] = useState(APP_ROLE === 'search' ? 'owners' : 'autopost')
   const [leads, setLeads] = useState([])
   const [source, setSource] = useState('demo')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [filter, setFilter] = useState('renter')
+  const [searchMode, setSearchMode] = useState('lead')
+  const [selectedOwnerIds, setSelectedOwnerIds] = useState([])
+  const [selectedLeadIds, setSelectedLeadIds] = useState([])
+  const [extractingOwners, setExtractingOwners] = useState(false)
+  const [reviewRefresh, setReviewRefresh] = useState(0)
   const [lastUpdated, setLastUpdated] = useState(null)
   // 'keyword' = fast rules (good for testing the scraper), 'ai' = Gemini.
   const [mode, setMode] = useState('keyword')
   const [minutes, setMinutes] = useState(180) // ช่วงเวลาที่ดึง (นาที)
+  const [groupCategory, setGroupCategory] = useState('all')
+  const [customGroupUrl, setCustomGroupUrl] = useState('')
   const [classifier, setClassifier] = useState(null)
   const [showGroups, setShowGroups] = useState(false)
   const [showKeywords, setShowKeywords] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
+  const [showGroupCrawlHistory, setShowGroupCrawlHistory] = useState(false)
+  const [skippedGroupKeys, setSkippedGroupKeys] = useState([])
+  const [groupHistoryConfigured, setGroupHistoryConfigured] = useState(false)
   const [viewingRound, setViewingRound] = useState(null) // history meta when reviewing a past round
   const [percent, setPercent] = useState(0)
   const [logs, setLogs] = useState([])
@@ -36,6 +52,7 @@ export default function App() {
   const [checkingSession, setCheckingSession] = useState(false)
   const [notice, setNotice] = useState(null) // transient toast
   const esRef = useRef(null)
+  const autoSavedOwnerIds = useRef(new Set())
 
   async function checkSession() {
     setCheckingSession(true)
@@ -78,11 +95,19 @@ export default function App() {
     setLogs([])
     setLeads([]) // clear so cards can stream in fresh
     esRef.current = streamLeads(
-      { minutes, mode, fresh },
+      {
+        minutes, mode, searchMode, fresh, groupCategory,
+        customUrl: groupCategory === 'custom-url' ? customGroupUrl : '',
+        skipGroups: groupCategory === 'custom-url' ? [] : skippedGroupKeys,
+      },
       {
         onProgress: ({ percent, message }) => {
           if (typeof percent === 'number') setPercent(percent)
           if (message) setLogs((l) => [...l, message].slice(-60))
+        },
+        onPipeline: (event) => {
+          const labels = { RAW_POST_SAVED: 'Raw post saved', DUPLICATE_SKIPPED: 'Duplicate skipped', JOB_QUEUED: 'Queued for processing', CLASSIFIED: `Classified: ${event.classification || ''}`, SEGMENTED: `Segmented: ${event.listingCount || 0} listings`, COMPLETED: 'Property saved', NEEDS_REVIEW: 'Needs review', RETRY_SCHEDULED: 'Retry scheduled', FAILED: 'Processing failed' }
+          setLogs((items) => [...items, labels[event.type] || event.type].slice(-60))
         },
         // Each group's leads arrive here → append (dedupe by id) so posts
         // show up progressively without waiting for the whole scrape.
@@ -94,6 +119,19 @@ export default function App() {
           })
           if (classifier) setClassifier(classifier)
           setSource('live')
+          if (searchMode === 'owner_listing') {
+            for (const post of leads.filter((item) => ['owner_rent', 'owner_sale', 'agent_listing', 'co_agent_listing'].includes(item.category))) {
+              const sourceKey = `${post.id}:${post.text || ''}`
+              if (autoSavedOwnerIds.current.has(sourceKey)) continue
+              autoSavedOwnerIds.current.add(sourceKey)
+              extractOwnerListing(post, false, true)
+                .then(() => setReviewRefresh((value) => value + 1))
+                .catch((saveError) => {
+                  autoSavedOwnerIds.current.delete(sourceKey)
+                  setError(`บันทึก Owner อัตโนมัติไม่สำเร็จ: ${saveError.message}`)
+                })
+            }
+          }
         },
         onDone: (data) => {
           setSource(data.source || 'demo')
@@ -119,9 +157,25 @@ export default function App() {
   // Refresh button: re-verify session first (user may have just run `npm run
   // login`), warn if still missing, then scrape.
   async function handleRefresh() {
+    if (groupCategory === 'custom-url' && !/facebook\.com\/groups\//i.test(customGroupUrl)) {
+      setNotice('⚠️ กรุณาวางลิงก์กลุ่ม Facebook ให้ถูกต้องก่อนเริ่มค้นหา')
+      return
+    }
     const ok = await checkSession()
     if (!ok) setNotice(NO_SESSION_MSG)
     load(true)
+  }
+
+  async function extractPosts(posts) {
+    if (!posts.length || extractingOwners) return
+    setExtractingOwners(true)
+    setError(null)
+    try {
+      for (const post of posts) await extractOwnerListing(post, !['owner_rent', 'owner_sale', 'agent_listing', 'co_agent_listing'].includes(post.category), false)
+      setSelectedOwnerIds([])
+      setReviewRefresh((value) => value + 1)
+    } catch (e) { setError(e.message) }
+    finally { setExtractingOwners(false) }
   }
 
   // Load a past search round from history into the main view.
@@ -156,10 +210,16 @@ export default function App() {
     [leads],
   )
 
-  const counts = { renter: renters.length, all: leads.length, other: others.length }
+  const acceptedOwners = useMemo(() => leads.filter((lead) => ['owner_rent', 'owner_sale', 'agent_listing', 'co_agent_listing'].includes(lead.category)), [leads])
+  const unknownOwners = useMemo(() => leads.filter((lead) => lead.category === 'unknown'), [leads])
+  const rejectedOwners = useMemo(() => leads.filter((lead) => !['owner_rent', 'owner_sale', 'agent_listing', 'co_agent_listing', 'unknown'].includes(lead.category)), [leads])
+  const counts = searchMode === 'owner_listing'
+    ? { owner: acceptedOwners.length, rejected: rejectedOwners.length, unknown: unknownOwners.length, all: leads.length }
+    : { renter: renters.length, all: leads.length, other: others.length }
 
-  const visible =
-    filter === 'renter' ? renters : filter === 'other' ? others : leads
+  const visible = searchMode === 'owner_listing'
+    ? filter === 'owner' ? acceptedOwners : filter === 'rejected' ? rejectedOwners : filter === 'unknown' ? unknownOwners : leads
+    : filter === 'renter' ? renters : filter === 'other' ? others : leads
 
   return (
     <div className="min-h-screen">
@@ -178,11 +238,18 @@ export default function App() {
       )}
 
       {appMode === 'autopost' && <AutoPostView />}
+      {appMode === 'settings' && <SettingsView />}
+      {/* Keep the owner workspace mounted while switching tabs. Its collection
+          stream therefore continues in the background instead of being
+          cancelled by a navigation-only UI change. */}
+      <div className={appMode === 'owners' ? '' : 'hidden'}>
+        <OwnerDatabaseView />
+      </div>
 
       <main
         className={`max-w-6xl mx-auto px-5 py-6 space-y-5 ${appMode === 'search' ? '' : 'hidden'}`}
       >
-        <StatsBar total={leads.length} renters={renters.length} others={others.length} />
+        {searchMode === 'lead' && <StatsBar total={leads.length} renters={renters.length} others={others.length} />}
 
         {error && (
           <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">
@@ -191,15 +258,49 @@ export default function App() {
         )}
 
         <div className="flex items-center justify-between gap-3 flex-wrap">
-          <FilterTabs active={filter} onChange={setFilter} counts={counts} />
+          <FilterTabs mode={searchMode} active={filter} onChange={setFilter} counts={counts} />
           <div className="flex items-center gap-3 flex-wrap">
+            <div className="inline-flex rounded-xl border border-slate-200 bg-white p-1">
+              <button type="button" onClick={() => { setSearchMode('lead'); setFilter('renter'); setLeads([]) }} className={`rounded-lg px-3 py-1.5 text-xs font-bold ${searchMode === 'lead' ? 'bg-indigo-600 text-white' : 'text-slate-500'}`}>🎯 Lead</button>
+              <button type="button" onClick={() => { setSearchMode('owner_listing'); setFilter('owner'); setLeads([]) }} className={`rounded-lg px-3 py-1.5 text-xs font-bold ${searchMode === 'owner_listing' ? 'bg-emerald-600 text-white' : 'text-slate-500'}`}>🏠 Property (Owner / Agent)</button>
+            </div>
+            <select
+              value={groupCategory}
+              onChange={(e) => setGroupCategory(e.target.value)}
+              disabled={loading}
+              className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-600"
+            >
+              <option value="all">ทุกชุดกลุ่ม</option>
+              <option value="general">ชุดกลุ่มทั่วไป</option>
+              <option value="pet">🐾 กลุ่มเลี้ยงสัตว์ได้</option>
+              <option value="owner">กลุ่มเจ้าของโดยตรง</option>
+              <option value="sale">กลุ่มซื้อ / ขาย</option>
+              <option value="custom">กลุ่มกำหนดเอง</option>
+              <option value="custom-url">🔗 ใช้ลิงก์นี้ครั้งเดียว</option>
+            </select>
+            {groupCategory === 'custom-url' && (
+              <input
+                value={customGroupUrl}
+                onChange={(e) => setCustomGroupUrl(e.target.value)}
+                placeholder="วางลิงก์กลุ่ม Facebook"
+                disabled={loading}
+                className="w-64 rounded-xl border border-indigo-200 bg-white px-3 py-1.5 text-sm outline-none focus:border-indigo-500"
+              />
+            )}
             <WindowSelect minutes={minutes} onChange={setMinutes} disabled={loading} />
             <ModeToggle mode={mode} onChange={setMode} disabled={loading} />
+            <button
+              onClick={() => setShowGroupCrawlHistory(true)}
+              disabled={loading || groupCategory === 'custom-url'}
+              className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-sm font-medium text-amber-700 hover:bg-amber-100 disabled:opacity-40"
+            >
+              🧭 ประวัติกลุ่ม{skippedGroupKeys.length ? ` · ข้าม ${skippedGroupKeys.length}` : ''}
+            </button>
             <button
               onClick={() => setShowGroups(true)}
               className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-50"
             >
-              ⚙️ กลุ่ม
+              ⚙️ คลัง/ชุดกลุ่ม
             </button>
             <button
               onClick={() => setShowKeywords(true)}
@@ -257,13 +358,17 @@ export default function App() {
         {/* Progress bar shows while loading — but cards below stream in live. */}
         {loading && <ProgressBar percent={percent} logs={logs} mode={mode} onStop={stop} />}
 
+        {searchMode === 'owner_listing' && <OwnerListingReviewQueue refreshToken={reviewRefresh} />}
+
+        {searchMode === 'owner_listing' && selectedOwnerIds.length > 0 && <div className="sticky top-2 z-20 flex items-center justify-between rounded-2xl border border-indigo-200 bg-white p-3 shadow-lg"><span className="text-sm font-bold text-slate-700">เลือกแล้ว {selectedOwnerIds.length} โพสต์</span><button disabled={extractingOwners} onClick={() => extractPosts(leads.filter((lead) => selectedOwnerIds.includes(lead.id)))} className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-bold text-white disabled:opacity-50">{extractingOwners ? 'กำลัง Extract…' : 'AI Extract รายการที่เลือก'}</button></div>}
+
         {visible.length > 0 ? (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {visible
               .slice()
               .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
               .map((lead) => (
-                <LeadCard key={lead.id} lead={lead} />
+                <LeadCard key={lead.id} lead={lead} selected={searchMode === 'owner_listing' ? selectedOwnerIds.includes(lead.id) : selectedLeadIds.includes(lead.id)} onSelect={searchMode === 'owner_listing' ? (checked) => setSelectedOwnerIds((ids) => checked ? [...new Set([...ids, lead.id])] : ids.filter((id) => id !== lead.id)) : (checked) => setSelectedLeadIds((ids) => checked ? [...new Set([...ids, lead.id])] : ids.filter((id) => id !== lead.id))} onExtract={searchMode === 'owner_listing' ? () => extractPosts([lead]) : undefined} />
               ))}
           </div>
         ) : (
@@ -271,8 +376,8 @@ export default function App() {
           (leads.length === 0 ? (
             <EmptyState
               icon="👆"
-              title="กดปุ่ม “ดึงโพสต์ล่าสุด” มุมขวาบนเพื่อเริ่มค้นหา"
-              subtitle="เลือกช่วงเวลา / โหมด ตามต้องการก่อน แล้วกดปุ่มเพื่อเริ่ม (ไม่ค้นหาอัตโนมัติ)"
+              title="กดปุ่ม “ค้นหาต่อ · เก็บโพสต์ใหม่” เพื่อเริ่ม"
+              subtitle="ระบบจะข้ามโพสต์ที่เคยพบ และไล่ย้อนหลังต่อจากระดับเดิมของแต่ละกลุ่ม"
             />
           ) : (
             <EmptyState
@@ -293,6 +398,8 @@ export default function App() {
         onClose={() => setShowGroups(false)}
         onSaved={() => {
           setShowGroups(false)
+          setSkippedGroupKeys([])
+          setGroupHistoryConfigured(false)
           load(true) // groups changed → re-scrape
         }}
       />
@@ -308,6 +415,16 @@ export default function App() {
         open={showHistory}
         onClose={() => setShowHistory(false)}
         onOpenRound={openRound}
+      />
+      <GroupCrawlHistoryModal
+        open={showGroupCrawlHistory}
+        onClose={() => setShowGroupCrawlHistory(false)}
+        currentSkipped={skippedGroupKeys}
+        configured={groupHistoryConfigured}
+        onApply={(keys) => {
+          setSkippedGroupKeys(keys)
+          setGroupHistoryConfigured(true)
+        }}
       />
 
       {/* Transient toast (e.g. no-session warning on connect actions) */}

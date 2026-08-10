@@ -90,6 +90,12 @@ npm run login    # แล้วรัน npm run dev ต่อ
 | `GEMINI_API_KEY` | key สำหรับโหมด AI |
 | `FB_GROUP_URLS` | กลุ่มตั้งต้น (คั่นด้วย `,`) — ปกติแก้ผ่านปุ่ม ⚙️ กลุ่ม แทน |
 | `HEADLESS=false` | เปิดให้เห็นเบราว์เซอร์ตอน scrape (ดีบั๊ก) |
+| `SCRAPER_CONCURRENCY=3` | จำนวนกลุ่มที่ค้นหาพร้อมกัน (1–6; ค่าสูงใช้เน็ตและหน่วยความจำมากขึ้น) |
+| `SCRAPER_SCROLL_DISTANCE=4500` | ระยะเลื่อนฟีดต่อรอบ |
+| `SCRAPER_SCROLL_WAIT_MS=900` | เวลารอโหลดหลังเลื่อนแต่ละรอบ (ต่ำสุด 350 ms) |
+| `SCRAPER_KNOWN_STOP_STEPS=3` | หยุดไล่ลึกเมื่อพบเฉพาะโพสต์เดิมต่อเนื่องตามจำนวนช่วงนี้ |
+| `SCRAPER_HOVER_DATES=1` | โหมด compatibility: hover เวลาโพสต์ที่อ่านจาก DOM ไม่ได้ (ช้ากว่า; ปกติปิดเพื่อค้นหาเร็ว) |
+| `POSTER_HEADLESS=false` | เปิดหน้าต่าง Chrome ตอนโพสต์อัตโนมัติ (ใช้เฉพาะดีบั๊ก; ปกติทำงานเบื้องหลัง) |
 | `DEBUG_SCRAPER=1` | เซฟ screenshot + html ลง `scratch-debug/` ไว้จูน selector |
 
 ## 🩹 แก้ปัญหาเบื้องต้น

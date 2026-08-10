@@ -9,6 +9,7 @@ dist
 
 # Facebook login session (contains cookies — never commit)
 server/fb-session.json
+server/jsa-session.json
 scratch-debug
 
 # User-edited group list
@@ -20,5 +21,12 @@ server/keywords.json
 # Local search history (Excel rounds)
 server/history/
 
+# Local owner-listing database
+server/owner-posts.json
+server/data/
+test-results/
+playwright-report/
+
 # Auto-post data (post sets, images, schedules) — local only, never shared
 server/autopost/
+server/backups/

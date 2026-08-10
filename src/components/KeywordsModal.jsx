@@ -7,8 +7,8 @@ const CATEGORY_META = {
   seller: { emoji: '💰', label: 'ผู้ขาย', sublabel: 'Seller', chipClass: 'bg-rose-100 text-rose-700 border-rose-200' },
 }
 
-// Mirror of server/keywords.defaults.json — shown immediately on open
-// (before the API responds) and used as fallback if API is on old code.
+// Mirror of server/keywords.defaults.json — used while the API loads and as
+// the "restore defaults" value.
 const BUILTIN_DEFAULTS = {
   renter: [
     'หาเช่า', 'อยากเช่า', 'ต้องการเช่า', 'มองหาห้อง', 'หาห้อง',
@@ -69,15 +69,15 @@ const BUILTIN_DEFAULTS = {
 }
 
 export default function KeywordsModal({ open, onClose, onSaved }) {
-  // Start with built-in defaults so chips show immediately, before API responds
+  // Every keyword is intentionally kept in one editable list. This includes
+  // words that originally shipped with the app.
   const [defaults, setDefaults] = useState(BUILTIN_DEFAULTS)
-  const [extras, setExtras]     = useState({ renter: [], owner: [], seller: [] })
+  const [keywords, setKeywords] = useState(BUILTIN_DEFAULTS)
   const [draft, setDraft]       = useState('')
   const [loading, setLoading]   = useState(false)
   const [saving, setSaving]     = useState(false)
   const [error, setError]       = useState(null)
   const [activeTab, setActiveTab] = useState('renter')
-  const [showDefaults, setShowDefaults] = useState(true)
 
   useEffect(() => {
     if (!open) return
@@ -88,10 +88,10 @@ export default function KeywordsModal({ open, onClose, onSaved }) {
       .then((d) => {
         // Use server-returned defaults if available (may differ when file is edited)
         if (d.defaults && Object.keys(d.defaults).length) setDefaults(d.defaults)
-        setExtras(d.extras || { renter: [], owner: [], seller: [] })
+        setKeywords(d.keywords || d.merged || BUILTIN_DEFAULTS)
       })
       .catch(() => {
-        // API on old code — silently keep BUILTIN_DEFAULTS, extras stay empty
+        // Keep the locally mirrored defaults if the server is unavailable.
       })
       .finally(() => setLoading(false))
   }, [open])
@@ -100,27 +100,32 @@ export default function KeywordsModal({ open, onClose, onSaved }) {
 
   const cat  = activeTab
   const meta = CATEGORY_META[cat]
-  const defList   = defaults[cat] || []
-  const extraList = extras[cat]   || []
+  const list = keywords[cat] || []
 
   function addKeyword() {
     const v = draft.trim().toLowerCase()
     if (!v) return
-    if ([...defList, ...extraList].includes(v)) { setError('มีคำนี้อยู่แล้ว'); return }
-    setExtras({ ...extras, [cat]: [...extraList, v] })
+    if (list.includes(v)) { setError('มีคำนี้อยู่แล้ว'); return }
+    setKeywords({ ...keywords, [cat]: [...list, v] })
     setDraft('')
     setError(null)
   }
 
-  function removeExtra(kw) {
-    setExtras({ ...extras, [cat]: extraList.filter((k) => k !== kw) })
+  function removeKeyword(kw) {
+    setKeywords({ ...keywords, [cat]: list.filter((k) => k !== kw) })
+    setError(null)
+  }
+
+  function restoreDefaults() {
+    setKeywords({ ...keywords, [cat]: defaults[cat] || [] })
+    setError(null)
   }
 
   async function handleSave() {
     setSaving(true)
     setError(null)
     try {
-      await saveKeywordsApi(extras)
+      await saveKeywordsApi(keywords)
       onSaved()
     } catch (e) {
       setError(e.message)
@@ -143,8 +148,7 @@ export default function KeywordsModal({ open, onClose, onSaved }) {
           <div>
             <h2 className="text-base font-bold text-slate-800">🏷️ ตั้งค่า Keyword คัดกรอง</h2>
             <p className="text-xs text-slate-400 mt-0.5">
-              ใช้ในโหมด ⚡ Keyword · Defaults มาจาก{' '}
-              <code className="bg-slate-100 px-1 rounded text-slate-500">keywords.defaults.json</code>
+              ใช้ในโหมด ⚡ Keyword · เพิ่ม ลบ และคืนค่าเริ่มต้นได้ทุกคำ
             </p>
           </div>
           <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-xl leading-none ml-4">
@@ -155,7 +159,7 @@ export default function KeywordsModal({ open, onClose, onSaved }) {
         {/* Tabs */}
         <div className="flex border-b border-slate-100 px-5 gap-0 shrink-0">
           {Object.entries(CATEGORY_META).map(([key, m]) => {
-            const total = (defaults[key]?.length || 0) + (extras[key]?.length || 0)
+            const total = keywords[key]?.length || 0
             return (
               <button
                 key={key}
@@ -179,76 +183,33 @@ export default function KeywordsModal({ open, onClose, onSaved }) {
 
         {/* Body — scrollable */}
         <div className="flex-1 overflow-auto px-5 py-4 space-y-4">
-          {/* Default keywords section */}
-          <div className="space-y-2">
-            <button
-              onClick={() => setShowDefaults((v) => !v)}
-              className="w-full flex items-center justify-between group"
-            >
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
-                  ค่าเริ่มต้น (Default)
-                </span>
-                <span className="rounded-full bg-slate-100 text-slate-500 text-[10px] font-bold px-1.5 py-0.5">
-                  {defList.length}
-                </span>
-                {loading && (
-                  <span className="text-[10px] text-slate-400 animate-pulse">กำลังโหลด...</span>
-                )}
-              </div>
-              <span className="text-[10px] text-slate-400 group-hover:text-slate-600 transition">
-                {showDefaults ? '▲ ซ่อน' : '▼ แสดง'}
-              </span>
-            </button>
-
-            {showDefaults && (
-              <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 p-3 space-y-2">
-                <p className="text-[11px] text-slate-400">
-                  มาจาก <code className="bg-white border border-slate-200 rounded px-1 py-0.5">keywords.defaults.json</code>{' '}
-                  — แก้ไขได้จากไฟล์โดยตรง ไม่ถูก commit
-                </p>
-                <div className="flex flex-wrap gap-1.5">
-                  {defList.length === 0 ? (
-                    <span className="text-xs text-slate-400 italic">ไม่มีค่าเริ่มต้น</span>
-                  ) : (
-                    defList.map((kw) => (
-                      <span
-                        key={kw}
-                        className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${meta.chipClass}`}
-                      >
-                        {kw}
-                      </span>
-                    ))
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* User extras section */}
           <div className="space-y-2">
             <div className="flex items-center gap-2">
               <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
-                เพิ่มเติมโดยผู้ใช้
+                Keyword ที่ใช้งาน
               </span>
               <span className="rounded-full bg-indigo-100 text-indigo-600 text-[10px] font-bold px-1.5 py-0.5">
-                {extraList.length}
+                {list.length}
               </span>
+              {loading && <span className="text-[10px] text-slate-400 animate-pulse">กำลังโหลด...</span>}
+              <button onClick={restoreDefaults} className="ml-auto text-[11px] text-slate-400 hover:text-indigo-600">
+                คืนค่าเริ่มต้น
+              </button>
             </div>
 
             <div className="flex flex-wrap gap-2 min-h-[2.5rem]">
-              {extraList.length === 0 ? (
+              {list.length === 0 ? (
                 <p className="text-xs text-slate-400 self-center">ยังไม่มี — เพิ่มด้านล่าง</p>
               ) : (
-                extraList.map((kw) => (
+                list.map((kw) => (
                   <span
                     key={kw}
-                    className="inline-flex items-center gap-1.5 rounded-full bg-indigo-50 border border-indigo-200 px-3 py-1.5 text-sm text-indigo-700"
+                    className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-sm ${meta.chipClass}`}
                   >
                     {kw}
                     <button
-                      onClick={() => removeExtra(kw)}
-                      className="text-indigo-300 hover:text-rose-500 font-bold text-xs leading-none"
+                      onClick={() => removeKeyword(kw)}
+                      className="opacity-50 hover:opacity-100 hover:text-rose-500 font-bold text-xs leading-none"
                     >
                       ✕
                     </button>
@@ -285,12 +246,7 @@ export default function KeywordsModal({ open, onClose, onSaved }) {
         {/* Footer */}
         <div className="flex items-center justify-between border-t border-slate-100 px-5 py-3 shrink-0">
           <span className="text-xs text-slate-400">
-            รวม {defList.length + extraList.length} คำ
-            <span className="text-slate-300 mx-1">·</span>
-            <span className="text-slate-400">{defList.length} default</span>
-            {extraList.length > 0 && (
-              <span className="text-indigo-500"> + {extraList.length} เพิ่มเติม</span>
-            )}
+            รวม {list.length} คำ · ลบได้ทุกคำ
           </span>
           <div className="flex gap-2">
             <button

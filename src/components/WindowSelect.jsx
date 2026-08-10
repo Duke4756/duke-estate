@@ -3,6 +3,9 @@ const WINDOWS = [
   { mins: 180, label: '3 ชม.' },
   { mins: 360, label: '6 ชม.' },
   { mins: 720, label: '12 ชม.' },
+  { mins: 1440, label: '1 วัน' },
+  { mins: 4320, label: '3 วัน' },
+  { mins: 10080, label: '7 วัน' },
 ]
 
 export default function WindowSelect({ minutes, onChange, disabled }) {

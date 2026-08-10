@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 import { getGroups, saveGroups } from '../api'
+import { hasGroup } from '../groupUrl'
+import { GROUP_SETS } from '../groupSets'
 
 export default function GroupsModal({ open, onClose, onSaved }) {
   const [items, setItems] = useState([]) // [{ url, active }]
@@ -13,7 +15,9 @@ export default function GroupsModal({ open, onClose, onSaved }) {
     setError(null)
     setLoading(true)
     getGroups()
-      .then((d) => setItems((d.groups || []).map((g) => ({ url: g.url, active: g.active !== false }))))
+      .then((d) => setItems((d.groups || []).map((g) => ({
+        url: g.url, active: g.active !== false, category: g.category || 'general', name: g.name || '',
+      }))))
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
   }, [open])
@@ -30,17 +34,21 @@ export default function GroupsModal({ open, onClose, onSaved }) {
       setError('ต้องเป็นลิงก์กลุ่ม Facebook เช่น https://www.facebook.com/groups/xxxx')
       return
     }
-    if (items.some((g) => g.url === v)) {
-      setError('มีกลุ่มนี้อยู่แล้ว')
+    if (hasGroup(items, v)) {
+      setError('ไม่สามารถเพิ่มได้ เนื่องจากมีกลุ่มนี้อยู่แล้ว')
       return
     }
-    setItems([...items, { url: v, active: true }])
+    setItems([...items, { url: v, active: true, category: 'general', name: '' }])
     setDraft('')
     setError(null)
   }
 
   function toggle(url) {
     setItems(items.map((g) => (g.url === url ? { ...g, active: !g.active } : g)))
+  }
+
+  function update(url, patch) {
+    setItems(items.map((g) => (g.url === url ? { ...g, ...patch } : g)))
   }
 
   async function handleSave() {
@@ -62,11 +70,11 @@ export default function GroupsModal({ open, onClose, onSaved }) {
       onClick={onClose}
     >
       <div
-        className="w-full max-w-lg rounded-2xl bg-white shadow-xl"
+        className="w-full max-w-2xl rounded-2xl bg-white shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
-          <h2 className="text-base font-bold text-slate-800">⚙️ ตั้งค่ากลุ่ม Facebook</h2>
+          <h2 className="text-base font-bold text-slate-800">⚙️ คลังกลุ่ม Facebook</h2>
           <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-xl leading-none">
             ✕
           </button>
@@ -74,13 +82,13 @@ export default function GroupsModal({ open, onClose, onSaved }) {
 
         <div className="px-5 py-4 space-y-3">
           <p className="text-xs text-slate-400">
-            เปิด/ปิดกลุ่มเพื่อเลือกดึงชั่วคราวโดยไม่ต้องลบ — เฉพาะกลุ่มที่ <b>เปิด</b> เท่านั้นที่จะถูกดึง
+            คลังนี้ใช้ร่วมกันทั้งค้นหาโพสต์และโพสต์อัตโนมัติ — จัดกลุ่มเป็นชุดเพื่อเรียกใช้พร้อมกันได้
           </p>
 
           {loading ? (
             <p className="text-sm text-slate-400 py-4 text-center">กำลังโหลด...</p>
           ) : (
-            <ul className="space-y-2 max-h-64 overflow-auto">
+            <ul className="space-y-2 max-h-[420px] overflow-auto">
               {items.length === 0 && (
                 <li className="text-sm text-slate-400 py-3 text-center">ยังไม่มีกลุ่ม</li>
               )}
@@ -91,11 +99,23 @@ export default function GroupsModal({ open, onClose, onSaved }) {
                     g.active ? 'bg-slate-50 border-slate-200' : 'bg-slate-50/40 border-slate-200/60'
                   }`}
                 >
-                  <div className={`min-w-0 ${g.active ? '' : 'opacity-45'}`}>
-                    <p className="text-sm font-medium text-slate-700">📁 {labelOf(g.url)}</p>
+                  <div className={`min-w-0 flex-1 ${g.active ? '' : 'opacity-45'}`}>
+                    <input
+                      value={g.name}
+                      onChange={(e) => update(g.url, { name: e.target.value })}
+                      placeholder={labelOf(g.url)}
+                      className="mb-1 w-full bg-transparent text-sm font-medium text-slate-700 outline-none"
+                    />
                     <p className="text-[11px] text-slate-400 truncate">{g.url}</p>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
+                    <select
+                      value={g.category}
+                      onChange={(e) => update(g.url, { category: e.target.value })}
+                      className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs"
+                    >
+                      {GROUP_SETS.map((set) => <option key={set.id} value={set.id}>{set.label}</option>)}
+                    </select>
                     {/* Active toggle */}
                     <button
                       onClick={() => toggle(g.url)}
@@ -161,7 +181,7 @@ export default function GroupsModal({ open, onClose, onSaved }) {
               disabled={saving || loading}
               className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
             >
-              {saving ? 'กำลังบันทึก...' : 'บันทึก & ดึงใหม่'}
+              {saving ? 'กำลังบันทึก...' : 'บันทึกคลังกลุ่ม'}
             </button>
           </div>
         </div>
