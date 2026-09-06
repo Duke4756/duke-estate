@@ -1,5 +1,6 @@
 import express from 'express'
 import { splitListingCluster } from '../db/repositories/listingClusters.js'
+import { SCHEDULER_POLICY } from '../config/sourceIntelligence.js'
 
 export function createSourcesRouter({ db, registry, scheduler, coverage, runJobs = async (_options = {}) => {} }) {
   const router = express.Router()
@@ -18,11 +19,17 @@ export function createSourcesRouter({ db, registry, scheduler, coverage, runJobs
     catch (error) { res.status(400).json({ error: message(error) }) }
   })
   router.post('/import', (req, res) => {
-    try {
-      const candidates = Array.isArray(req.body?.candidates) ? req.body.candidates : parseDelimited(req.body?.text || '')
-      const results = candidates.map((candidate) => registry.addCandidate({ ...candidate, discoveredVia: candidate.discoveredVia || 'user_import' }))
-      res.json({ imported: results.length, unique: new Set(results.map((item) => item.id)).size, sources: results })
-    } catch (error) { res.status(400).json({ error: message(error) }) }
+    const candidates = Array.isArray(req.body?.candidates) ? req.body.candidates : parseDelimited(req.body?.text || '')
+    const sources = []; const errors = []
+    for (const [index, candidate] of candidates.entries()) {
+      try {
+        if (candidate._parseError) throw new Error(candidate._parseError)
+        sources.push(registry.addCandidate({ ...candidate, discoveredVia: candidate.discoveredVia || 'user_import' }))
+      }
+      catch (error) { errors.push({ line: index + 1, input: candidate.url || '', error: message(error) }) }
+    }
+    const added = sources.filter((item) => item._created).length
+    res.json({ received: candidates.length, added, duplicates: sources.length - added, invalid: errors.length, sources, errors })
   })
   router.post('/discover-visible', (req, res) => {
     try {
@@ -61,8 +68,14 @@ export function createSourcesRouter({ db, registry, scheduler, coverage, runJobs
   router.post('/scheduler/plan', (req, res) => { try { res.json({ jobs: scheduler.plan(req.body || {}) }) } catch (error) { res.status(400).json({ error: message(error) }) } })
   router.post('/refresh-now', (_req, res) => {
     try {
-      const planned = scheduler.plan({ lane: 'FRESHNESS', force: true })
-      queueMicrotask(() => runJobs({ manual: true }).catch((error) => console.error('Manual source refresh failed:', message(error))))
+      // A manual refresh is a small, prioritized delta capture—not an
+      // unbounded drain of every historical pending job. This keeps one click
+      // responsive on the same machine that serves the UI and database.
+      const now = new Date().toISOString()
+      db.prepare("UPDATE source_crawl_jobs SET status='CANCELLED',completed_at=?,updated_at=? WHERE status IN ('PENDING','RETRY')").run(now, now)
+      const limit = SCHEDULER_POLICY.manualRefreshSourceBudget
+      const planned = scheduler.plan({ lane: 'FRESHNESS', force: true, limit })
+      queueMicrotask(() => runJobs({ manual: true, maxJobs: planned.length }).catch((error) => console.error('Manual source refresh failed:', message(error))))
       res.status(202).json({ status: 'running', planned })
     } catch (error) { res.status(500).json({ error: message(error) }) }
   })
@@ -76,7 +89,10 @@ export function createSourcesRouter({ db, registry, scheduler, coverage, runJobs
 
 function parseDelimited(text) {
   return String(text).split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
-    if (line.startsWith('{')) return JSON.parse(line)
+    if (line.startsWith('{')) {
+      try { return JSON.parse(line) }
+      catch { return { url: line, _parseError: 'JSON ไม่ถูกต้อง' } }
+    }
     const [url, name = ''] = line.split(',').map((value) => value.trim())
     return { url, name }
   })

@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
-import { launchBrowser } from './browserLauncher.js'
+import { launchBrowser, LOW_RESOURCE_INTERACTIVE_ARGS, reduceInteractiveContextLoad } from './browserLauncher.js'
 import { detectGroupMembership, normalizeFacebookGroupUrl } from './groupMembership.js'
 import { saveGroupMembership } from './groupMembershipStore.js'
 
@@ -22,6 +22,7 @@ const verificationCache = new Map()
 
 function clearPendingLogin(id, item) {
   if (pending.get(id) === item) pending.delete(id)
+  if (item?.expiryTimer) clearTimeout(item.expiryTimer)
 }
 
 function pendingLoginIsClosed(item) {
@@ -249,6 +250,7 @@ export async function listAccountsVerified({ force = false } = {}) {
   }
 }
 
+
 export function accountSessionPath(id = 'primary') {
   return read().find((item) => item.id === id)?.sessionPath || null
 }
@@ -290,11 +292,14 @@ export async function startAccountLogin(name, existingId = null) {
   const sessionPath = existing?.sessionPath || path.join(dir, `session-${id}.json`)
   let browser
   try {
-    browser = await launchBrowser({ headless: false })
+    browser = await launchBrowser({ headless: false, args: LOW_RESOURCE_INTERACTIVE_ARGS })
     const context = await browser.newContext({
-      viewport: { width: 1280, height: 900 },
+      viewport: { width: 1100, height: 760 },
       locale: 'th-TH',
+      serviceWorkers: 'block',
+      reducedMotion: 'reduce',
     })
+    await reduceInteractiveContextLoad(context)
     await context.addInitScript(() => {
       Object.defineProperty(globalThis.navigator, 'webdriver', { get: () => undefined })
       Object.defineProperty(globalThis.navigator, 'languages', { get: () => ['th-TH', 'th', 'en'] })
@@ -317,6 +322,8 @@ export async function startAccountLogin(name, existingId = null) {
       reauth: Boolean(existing),
       startedAt: new Date().toISOString(),
     }
+    item.expiryTimer = setTimeout(() => browser.close().catch(() => {}), 15 * 60_000)
+    item.expiryTimer.unref()
     pending.set(id, item)
     browser.once('disconnected', () => clearPendingLogin(id, item))
     page.once('close', () => clearPendingLogin(id, item))
@@ -325,6 +332,10 @@ export async function startAccountLogin(name, existingId = null) {
     await browser?.close().catch(() => {})
     throw error
   }
+}
+
+export function interactiveAccountBrowserOpen() {
+  return pending.size > 0 || pendingMembership.size > 0
 }
 
 export async function accountLoginStatus(id) {

@@ -9,14 +9,18 @@ const RULES = [
 
 export function classifyIntent(rawText) {
   const text = String(rawText || '')
-  // Explicit service advertisements are not inventory.
   const serviceMatch = text.match(RULES[0][1])
-  if (serviceMatch) return result('service_or_spam', 0.88, serviceMatch[0])
-  const hasRentOffer = /ปล่อยเช่า|ให้เช่า|ว่างให้เช่า|for rent|available for rent|ราคาเช่า|ค่าเช่า|rental?\s*price/iu.test(text)
-  const hasSaleOffer = /ขายคอนโด|ขายห้อง|ขายบ้าน|ขายดาวน์|for sale|ราคาขาย|ขาย\s*(?:฿\s*)?\d[\d,.]*\s*(?:ล้าน|บาท|thb|k)/iu.test(text)
+  const hasPricedOffer = /(?:thb|฿)?\s*\d[\d,.]*\s*(?:บาท|thb)?\s*(?:\/|ต่อ)\s*(?:เดือน|month)|(?:ขาย|sale|ราคา)[^\n]{0,120}?\d[\d,.]*\s*(?:m|mb|ล้าน|บาท|thb|k)/iu.test(text)
+  if (serviceMatch && !hasPricedOffer) return result('service_or_spam', 0.88, serviceMatch[0])
+  const hasRentOffer = /ปล่อยเช่า|ให้เช่า|ว่างให้เช่า|for rent|available for rent|ราคาเช่า|ค่าเช่า|rental?\s*price|(?:เช่า|rent(?:al)?)\s*[:：-]?\s*(?:thb|฿)?\s*\d[\d,.]*|(?:thb|฿)?\s*\d[\d,.]*\s*(?:บาท|thb)?\s*(?:\/|ต่อ)\s*(?:เดือน|month)/iu.test(text)
+  const hasSaleOffer = /ขายคอนโด|ขายห้อง|ขายบ้าน|ขายที่ดิน|ขายดาวน์|for sale|quick sale|ราคาขาย|sale\s*(?:price\s*)?[:：-]?\s*(?:thb|฿)?\s*\d[\d,.]*\s*(?:m|mb|ล้าน|บาท|thb)?|ขาย[^\n]{0,120}?\d[\d,.]*\s*(?:ล้าน|บาท|thb|k)/iu.test(text)
   if (hasRentOffer && hasSaleOffer) return result('offer_rent_and_sale', 0.96, text)
   if (hasRentOffer) return result('offer_rent', 0.94, text)
   if (hasSaleOffer) return result('offer_sale', 0.94, text)
+  // Service words inside a concrete priced listing (for example assistance
+  // with financing) must not erase the inventory. Only service-only posts
+  // reach this branch.
+  if (serviceMatch) return result('service_or_spam', 0.88, serviceMatch[0])
   // A cooperation-only request has no available property. A co-agent post
   // containing a concrete rent/sale offer was already classified above and
   // is saved as inventory with source_role=co_agent.

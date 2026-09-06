@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { launchBrowser } from './browserLauncher.js'
+import { launchBrowser, LOW_RESOURCE_INTERACTIVE_ARGS, reduceInteractiveContextLoad } from './browserLauncher.js'
 import { parsePropertyHtml } from './propertyImporter.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -9,6 +9,9 @@ const SESSION_FILE = process.env.JSA_SESSION_PATH || path.join(__dirname, 'jsa-s
 let loginBrowser = null
 let loginContext = null
 let loginPage = null
+let loginExpiryTimer = null
+let lastRefreshedAt = null
+let lastRefreshError = null
 
 export function isJsaPropertyUrl(value) {
   try {
@@ -19,10 +22,104 @@ export function isJsaPropertyUrl(value) {
 }
 
 export function jsaSessionStatus() {
-  return { connected: fs.existsSync(SESSION_FILE), loginOpen: Boolean(loginBrowser) }
+  return { connected: fs.existsSync(SESSION_FILE), loginOpen: Boolean(loginBrowser), lastRefreshedAt, lastRefreshError }
+}
+
+function invalidateExpiredJsaSession() {
+  // An expired cookie file cannot recover by retrying. Removing only this
+  // unusable credential snapshot stops the one-minute browser retry loop and
+  // makes the UI truthfully request a new login.
+  try { fs.unlinkSync(SESSION_FILE) } catch { /* already absent */ }
+}
+
+export async function listJsaPropertyCandidates() {
+  if (!fs.existsSync(SESSION_FILE)) throw new Error('กรุณาเชื่อมต่อและล็อกอิน JSA ก่อนนำเข้าประกาศ')
+  const browser = await launchBrowser({ headless: true })
+  try {
+    const context = await browser.newContext({ storageState: SESSION_FILE, locale: 'th-TH', viewport: { width: 1440, height: 1000 } })
+    const page = await context.newPage()
+    await page.goto('https://www.jsa.co.th/admin/property', { waitUntil: 'domcontentloaded', timeout: 60_000 })
+    // This React page keeps background requests open and can replace its page
+    // during `networkidle`. Wait for the actual table instead.
+    let tableReady = false
+    for (let attempt = 0; attempt < 3 && !tableReady; attempt += 1) {
+      try {
+        await page.waitForSelector('a[href*="/admin/property/view/"]', { state: 'attached', timeout: 12_000 })
+        tableReady = true
+      } catch {
+        if (attempt < 2) await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {})
+      }
+    }
+    await page.waitForTimeout(2_000)
+    const bodyText = await page.locator('body').innerText().catch(() => '')
+    if (/login|sign-in/i.test(new URL(page.url()).pathname) || /เข้าสู่ระบบ|ลงชื่อเข้าใช้/i.test(bodyText.slice(0, 1500))) {
+      invalidateExpiredJsaSession()
+      throw new Error('Session JSA หมดอายุ กรุณาเชื่อมต่อ JSA ใหม่')
+    }
+    if (!tableReady) throw new Error('หน้า JSA ไม่แสดงรายการทรัพย์หลังลองใหม่ 3 ครั้ง ระบบจะลองอีกครั้งอัตโนมัติใน 1 นาที')
+    const candidates = await page.evaluate(() => [...document.querySelectorAll('tbody tr')].map((row, order) => {
+      const cells = [...row.querySelectorAll(':scope > td')]
+      const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim()
+      const detail = row.querySelector('a[href*="/admin/property/view/"]')
+      const sourceUrl = detail ? new URL(detail.getAttribute('href'), location.origin).href : ''
+      const pmCell = cells[12]
+      const availableCell = cells[11]
+      const approvalCell = cells[14]
+      const imageCell = cells[15]
+      const updatedTime = cells[16]?.querySelector('time')?.getAttribute('datetime') || ''
+      const price = Number(clean(cells[8]?.innerText).replace(/[^\d.]/g, '')) || 0
+      return {
+        id: sourceUrl.match(/\/view\/(\d+)/)?.[1] || '',
+        sourceUrl,
+        ref: clean(cells[1]?.innerText),
+        price,
+        // JSA does not expose deal type in the list. Detail import verifies it;
+        // this conservative threshold matches the portal's rental pricing.
+        deal: price > 0 && price < 1_000_000 ? 'rent' : 'sale',
+        available: /ว่าง|available/i.test(clean(availableCell?.innerText)) && /text-green|bg-green/.test(availableCell?.innerHTML || ''),
+        pmApproved: /text-green|bg-green/.test(pmCell?.innerHTML || ''),
+        approved: /อนุมัติแล้ว/i.test(clean(approvalCell?.innerText)) && /text-green|bg-green/.test(approvalCell?.innerHTML || ''),
+        hasImages: /มีรูป/i.test(clean(imageCell?.innerText)) && /text-green|bg-green/.test(imageCell?.innerHTML || ''),
+        updatedAt: updatedTime,
+        order,
+      }
+    }).filter((item) => item.id && item.sourceUrl))
+    await context.storageState({ path: SESSION_FILE })
+    lastRefreshedAt = new Date().toISOString()
+    lastRefreshError = null
+    return candidates
+  } finally {
+    await browser.close()
+  }
+}
+
+export async function refreshJsaSession() {
+  if (!fs.existsSync(SESSION_FILE)) return { ...jsaSessionStatus(), skipped: 'not-connected' }
+  const browser = await launchBrowser({ headless: true })
+  try {
+    const context = await browser.newContext({ storageState: SESSION_FILE, locale: 'th-TH', viewport: { width: 1280, height: 800 } })
+    const page = await context.newPage()
+    await page.goto('https://www.jsa.co.th/admin/property', { waitUntil: 'domcontentloaded', timeout: 60_000 })
+    const bodyText = await page.locator('body').innerText().catch(() => '')
+    if (/login|sign-in/i.test(new URL(page.url()).pathname) || /เข้าสู่ระบบ|ลงชื่อเข้าใช้/i.test(bodyText.slice(0, 1500))) {
+      invalidateExpiredJsaSession()
+      throw new Error('Session JSA หมดอายุ กรุณาเชื่อมต่อ JSA ใหม่')
+    }
+    await context.storageState({ path: SESSION_FILE })
+    lastRefreshedAt = new Date().toISOString()
+    lastRefreshError = null
+    return jsaSessionStatus()
+  } catch (error) {
+    lastRefreshError = error.message || String(error)
+    throw error
+  } finally {
+    await browser.close().catch(() => {})
+  }
 }
 
 async function closeLoginBrowser() {
+  if (loginExpiryTimer) clearTimeout(loginExpiryTimer)
+  loginExpiryTimer = null
   try { await loginBrowser?.close() } catch { /* already closed */ }
   loginBrowser = null
   loginContext = null
@@ -31,11 +128,14 @@ async function closeLoginBrowser() {
 
 export async function startJsaLogin(targetUrl = 'https://www.jsa.co.th/admin/property') {
   await closeLoginBrowser()
-  loginBrowser = await launchBrowser({ headless: false })
-  loginContext = await loginBrowser.newContext({ locale: 'th-TH', viewport: { width: 1440, height: 960 } })
+  loginBrowser = await launchBrowser({ headless: false, args: LOW_RESOURCE_INTERACTIVE_ARGS })
+  loginContext = await loginBrowser.newContext({ locale: 'th-TH', viewport: { width: 1100, height: 760 }, serviceWorkers: 'block', reducedMotion: 'reduce' })
+  await reduceInteractiveContextLoad(loginContext)
   loginPage = await loginContext.newPage()
   const safeTarget = isJsaPropertyUrl(targetUrl) ? targetUrl : 'https://www.jsa.co.th/admin/property'
   await loginPage.goto(safeTarget, { waitUntil: 'domcontentloaded', timeout: 60_000 })
+  loginExpiryTimer = setTimeout(() => closeLoginBrowser(), 15 * 60_000)
+  loginExpiryTimer.unref()
   return jsaSessionStatus()
 }
 
@@ -96,8 +196,8 @@ export async function importJsaProperty(sourceUrl) {
   try {
     const context = await browser.newContext({ storageState: SESSION_FILE, locale: 'th-TH', viewport: { width: 1440, height: 1200 } })
     const page = await context.newPage()
-    await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 })
-    await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {})
+    await page.goto(sourceUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+    await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {})
     const currentUrl = page.url()
     const bodyText = await page.locator('body').innerText().catch(() => '')
     if (/login|sign-in/i.test(new URL(currentUrl).pathname) || /เข้าสู่ระบบ|ลงชื่อเข้าใช้/i.test(bodyText.slice(0, 1500))) {
@@ -204,28 +304,58 @@ export async function importJsaProperty(sourceUrl) {
     // through the authenticated page so it uses Chrome's system trust store,
     // cookies, referer and the exact browser session.
     const images = await page.evaluate(async ({ urls, maxEach, maxTotal }) => {
-      const output = []
-      let total = 0
-      for (const url of urls) {
+      // Fetch in parallel. Sequential 20-second timeouts could make a
+      // 10-photo room block inventory refills for more than three minutes.
+      const fetched = await Promise.all(urls.map(async (url) => {
         try {
-          const response = await fetch(url, { credentials: 'include', signal: AbortSignal.timeout(20_000) })
-          if (!response.ok) continue
+          const response = await fetch(url, { credentials: 'include', signal: AbortSignal.timeout(10_000) })
+          if (!response.ok) return null
           const blob = await response.blob()
-          if (!blob.type.startsWith('image/') || blob.type === 'image/svg+xml' || blob.size > maxEach || total + blob.size > maxTotal) continue
+          if (!blob.type.startsWith('image/') || blob.type === 'image/svg+xml' || blob.size > maxEach) return null
           const dataUrl = await new Promise((resolve, reject) => {
             const reader = new FileReader()
             reader.onload = () => resolve(reader.result)
             reader.onerror = reject
             reader.readAsDataURL(blob)
           })
-          total += blob.size
-          output.push(dataUrl)
-        } catch { /* skip individual broken images */ }
+          return { dataUrl, size: blob.size }
+        } catch { return null }
+      }))
+      const output = []
+      let total = 0
+      for (const image of fetched) {
+        if (!image || total + image.size > maxTotal) continue
+        total += image.size
+        output.push(image.dataUrl)
       }
       return output
     }, { urls: imageUrls, maxEach: 8 * 1024 * 1024, maxTotal: 35 * 1024 * 1024 })
-    return { sourceUrl: currentUrl, name, text, images, imageCount: images.length }
+    await context.storageState({ path: SESSION_FILE })
+    lastRefreshedAt = new Date().toISOString()
+    lastRefreshError = null
+    return { sourceUrl: currentUrl, name, text, images, imageCount: images.length, deal: dom.property.deal }
   } finally {
     await browser.close()
   }
+}
+
+export async function resolveJsaPropertyUrlByCd(cd) {
+  const code = String(cd || '').trim().toUpperCase()
+  if (!/^CD-\d{6}$/.test(code)) { const error = new Error('invalid CD'); error.code = 'INVALID_CD'; throw error }
+  if (!fs.existsSync(SESSION_FILE)) { const error = new Error('JSA login required'); error.code = 'JSA_LOGIN_REQUIRED'; throw error }
+  const browser = await launchBrowser({ headless: true }); try {
+    const context = await browser.newContext({ storageState: SESSION_FILE, locale: 'th-TH' }); const page = await context.newPage()
+    await page.goto('https://www.jsa.co.th/admin/property', { waitUntil: 'domcontentloaded', timeout: 30_000 }); await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {})
+    const input = page.getByLabel(/รหัสทรัพย์สิน/i).first(); if (await input.count()) { await input.fill(code); await input.press('Enter') } else { const any = page.locator('input').first(); if (await any.count()) { await any.fill(code); await any.press('Enter').catch(() => {}) } }
+    await page.waitForTimeout(800)
+    const rows = await page.locator('tr').evaluateAll((nodes, wanted) => nodes.filter((node) => (node.innerText || '').toUpperCase().includes(wanted)).length, code)
+    const links = await page.locator('a[href*="/admin/property/view/"]').evaluateAll((nodes, wanted) => nodes.filter((node) => (node.closest('tr')?.innerText || node.innerText || '').toUpperCase().includes(wanted)).map((node) => node.href), code)
+    const unique = [...new Set(links)]
+    if (!unique.length) { const error = new Error(`ไม่มีลิงก์ดูทรัพย์สำหรับ ${code}`); error.code = rows ? 'VIEW_LINK_NOT_FOUND' : 'CD_NOT_FOUND'; throw error }
+    if (unique.length > 1) { const error = new Error(`multiple CD matches: ${code}`); error.code = 'MULTIPLE_MATCH'; throw error }
+    return unique[0]
+  } catch (error) {
+    if (error?.name === 'TimeoutError' || /timeout/i.test(error?.message || '')) error.code = 'TIMEOUT'
+    throw error
+  } finally { await browser.close() }
 }

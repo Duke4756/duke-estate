@@ -61,7 +61,11 @@ function normalize(list) {
       ? String(g.category).trim()
       : 'general'
     const name = typeof g === 'object' ? String(g.name || '').trim() : ''
-    out.push({ url, active: typeof g === 'object' ? g.active !== false : true, category, name })
+    const memberCount = typeof g === 'object' && Number.isFinite(Number(g.memberCount)) ? Number(g.memberCount) : null
+    const marketingTags = typeof g === 'object' && Array.isArray(g.marketingTags) ? [...new Set(g.marketingTags.map((tag) => String(tag).trim().toUpperCase()).filter(Boolean))] : []
+    const projectTags = typeof g === 'object' && Array.isArray(g.projectTags) ? [...new Set(g.projectTags.map((tag) => String(tag).trim()).filter(Boolean))] : []
+    const projectIds = typeof g === 'object' && Array.isArray(g.projectIds) ? [...new Set(g.projectIds.map((tag) => String(tag).trim()).filter(Boolean))] : []
+    out.push({ url, active: typeof g === 'object' ? g.active !== false : true, category, name, memberCount, marketingTags, projectTags, projectIds, notes: typeof g === 'object' ? String(g.notes || '') : '' })
   }
   return out
 }
@@ -90,6 +94,17 @@ export function loadGroupsByCategory(category = 'all') {
   return loadGroupsFull()
     .filter((g) => g.active && (category === 'all' || g.category === category))
     .map((g) => g.url)
+}
+
+export function getGroups({ tags = [], project = '', projectId = '', accountId = '', memberOnly = false, enabledOnly = true } = {}, memberships = {}) {
+  const wanted = tags.map((tag) => String(tag).toUpperCase())
+  return loadGroupsFull().filter((group) => {
+    if (enabledOnly && group.active === false) return false
+    if (wanted.length && !wanted.every((tag) => (group.marketingTags || []).includes(tag))) return false
+    if ((project && !(group.projectTags || []).includes(project)) || (projectId && !(group.projectIds || []).includes(projectId))) return false
+    if (memberOnly && memberships?.[group.url]?.[accountId]?.status !== 'MEMBER') return false
+    return true
+  }).sort((a, b) => (((b.projectTags || []).includes(project) || (b.projectIds || []).includes(projectId)) ? 1 : 0) - (((a.projectTags || []).includes(project) || (a.projectIds || []).includes(projectId)) ? 1 : 0) || (b.marketingTags || []).filter((tag) => wanted.includes(tag)).length - (a.marketingTags || []).filter((tag) => wanted.includes(tag)).length)
 }
 
 export function saveGroups(list) {

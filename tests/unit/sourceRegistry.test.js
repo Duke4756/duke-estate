@@ -18,6 +18,8 @@ describe('source registry', () => {
     expect(renamed.id).toBe(first.id)
     expect(registry.list()).toHaveLength(1)
     expect(renamed.group_name).toBe('ชื่อใหม่')
+    expect(first._created).toBe(true)
+    expect(renamed._created).toBe(false)
   })
   it('never schedules discovered, paused or inaccessible sources', () => {
     const { registry } = setup()

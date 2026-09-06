@@ -6,6 +6,16 @@ import { createPropertyDataService } from '../../server/db/service.js'
 const input = (id = 'post-1') => ({ source_adapter: 'facebook_group', source_post_id: id, source_url: `https://facebook.com/groups/1/posts/${id}`, raw_text: 'ให้เช่า 25,000 บาท/เดือน ใกล้ BTS อ่อนนุช', collector_version: 'test' })
 
 describe('recoverable post processing queue', () => {
+  it('does not persist explicit agent posts in owner-only mode', () => {
+    const db = openDatabase(':memory:')
+    const queue = new PostProcessingQueue({ db, processor: async () => ({ propertyIds: [] }) })
+    queue.kick = () => {}
+    const result = queue.captureAndEnqueue({ ...input('agent-only'), raw_text: 'Agent post ให้เช่า Test Residence 20,000 บาท/เดือน' })
+    expect(result).toMatchObject({ excluded: true, excludedRole: 'agent', inserted: false })
+    expect(db.prepare('SELECT COUNT(*) count FROM raw_posts').get().count).toBe(0)
+    db.close()
+  })
+
   it('commits raw post and job before invoking extraction', async () => {
     const db = openDatabase(':memory:')
     let observed = null

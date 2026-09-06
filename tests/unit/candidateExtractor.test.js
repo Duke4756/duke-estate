@@ -103,6 +103,11 @@ describe('candidate extractor', () => {
     expect(deterministicExtract(text).properties[0].project_name_raw).toBe(expected)
   })
 
+  it('cleans repeated names and Facebook expansion text', () => {
+    expect(deterministicExtract('ให้เช่า Aspire Sukhumvit - Onnut Aspire Sukhumvit - Onnut\n20,000 บาท/เดือน').properties[0].project_name_raw).toBe('Aspire Sukhumvit - Onnut')
+    expect(deterministicExtract('ให้เช่า The Line Sukhumvit ดูน้อยลง\n20,000 บาท/เดือน').properties[0].project_name_raw).toBe('The Line Sukhumvit')
+  })
+
   it.each([
     ['Duplex condo for rent 2 bedrooms 45,000 บาท/เดือน', 'duplex'],
     ['Penthouse for rent 3 bedrooms 120,000 บาท/เดือน', 'penthouse'],

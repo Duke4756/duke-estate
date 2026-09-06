@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { displayScheduleStatus, isOneTimePostComplete, scheduleStatusForResults } from '../../server/schedules.js'
-import { facebookPostPermalink, postVerificationMarkers } from '../../server/facebookPostMatch.js'
+import { facebookPostPermalink, isPostCardRecent, postVerificationMarkers } from '../../server/facebookPostMatch.js'
 
 describe('Facebook feed content matching', () => {
   it('uses the property reference before formatted Facebook text', () => {
@@ -22,6 +22,9 @@ describe('Facebook feed content matching', () => {
     expect(facebookPostPermalink([
       'https://www.facebook.com/permalink.php?story_fbid=888&id=123',
     ])).toBe('https://www.facebook.com/groups/123/posts/888/')
+    expect(facebookPostPermalink([
+      'https://www.facebook.com/groups/123/?multi_permalinks=999&ref=share',
+    ])).toBe('https://www.facebook.com/groups/123/posts/999/')
   })
 })
 
@@ -30,10 +33,24 @@ describe('Facebook group-card verification', () => {
     expect(scheduleStatusForResults([{ ok: true, verified: 'permalink', postUrl: 'https://facebook.com/groups/1/posts/2' }])).toBe('done')
   })
 
-  it('counts an exact fresh card found inside the target group without requiring a permalink', () => {
-    const found = { ok: true, verified: 'group_card', postUrl: null }
+  it('accepts a freshly submitted matching group card when Facebook hides its permalink', () => {
+    const found = { ok: true, submitted: true, verified: 'group_card', postUrl: null }
     expect(scheduleStatusForResults([found])).toBe('done')
     expect(isOneTimePostComplete({}, [found])).toBe(true)
+  })
+
+  it('rejects a group card without evidence that this run submitted it', () => {
+    const oldCard = { ok: true, verified: 'group_card', postUrl: null }
+    expect(scheduleStatusForResults([oldCard])).toBe('failed')
+    expect(isOneTimePostComplete({}, [oldCard])).toBe(false)
+  })
+
+  it('does not accept a composer photo pcb id as a published permalink', () => {
+    expect(facebookPostPermalink(
+      ['https://www.facebook.com/photo/?fbid=99&set=pcb.123456789'],
+      'https://www.facebook.com/groups/820669979671477/',
+      { allowPhotoFallback: false },
+    )).toBeNull()
   })
 
   it('does not accept a group tracking link as proof of publication', () => {
@@ -56,6 +73,37 @@ describe('Facebook group-card verification', () => {
       { ok: true, verified: 'permalink', postUrl: 'https://facebook.com/groups/1/posts/2' },
       { ok: false, pending: true, verified: 'unconfirmed' },
     ])).toBe('done')
+  })
+})
+
+describe('delayed Facebook post verification', () => {
+  const submittedAt = '2026-08-10T07:00:00.000Z'
+  const now = new Date('2026-08-10T07:10:00.000Z').getTime()
+
+  it('accepts a Facebook unix timestamp close to submission time', () => {
+    expect(isPostCardRecent({ unixTimes: ['1786345380'], submittedAt, now })).toBe(true)
+  })
+
+  it('accepts a recent relative timestamp but rejects an old card', () => {
+    expect(isPostCardRecent({ cardText: 'โพสต์นี้ 8 นาที', submittedAt, now })).toBe(true)
+    expect(isPostCardRecent({ cardText: 'โพสต์นี้ 2 ชั่วโมง', submittedAt, now })).toBe(false)
+  })
+
+  it('accepts a timestamp exposed through Facebook accessibility labels', () => {
+    expect(isPostCardRecent({
+      cardText: 'CD-100152\n17 สิงหาคม เวลา 14:05 น.\nโพสต์เมื่อ 5 นาทีที่แล้ว',
+      submittedAt,
+      now,
+    })).toBe(true)
+  })
+
+  it('allows Facebook rounded hour labels for a post submitted in that hour', () => {
+    const hourNow = new Date('2026-08-10T08:10:00.000Z').getTime()
+    expect(isPostCardRecent({ cardText: 'CD-100152 · 1 ชั่วโมง', submittedAt, now: hourNow })).toBe(true)
+  })
+
+  it('rejects cards without trustworthy time evidence', () => {
+    expect(isPostCardRecent({ cardText: 'CD-100152 ห้องสวย', submittedAt, now })).toBe(false)
   })
 })
 

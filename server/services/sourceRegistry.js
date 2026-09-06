@@ -36,19 +36,30 @@ export function createSourceRegistry(db) {
       const now = new Date().toISOString()
       const existing = (normalized.sourceGroupId && byIdentity.get(normalized.sourceGroupId)) || byUrl.get(normalized.canonicalUrl) || (nameNormalized && byName.get(nameNormalized))
       let id
+      let created = false
       if (existing) {
         id = existing.id
         db.prepare(`UPDATE source_groups SET source_group_id=COALESCE(source_group_id,?),canonical_url=?,group_name=COALESCE(NULLIF(?,''),group_name),group_name_normalized=COALESCE(NULLIF(?,''),group_name_normalized),privacy_type=COALESCE(NULLIF(?,''),privacy_type),visibility_type=COALESCE(NULLIF(?,''),visibility_type),relevance_score=MAX(relevance_score,?),metadata_json=?,tags_json=?,updated_at=? WHERE id=?`).run(normalized.sourceGroupId, normalized.canonicalUrl, input.name || '', nameNormalized, input.privacyType || '', input.visibilityType || '', classification.relevance, JSON.stringify(input.metadata || {}), JSON.stringify(classification.tags), now, id)
       } else {
-        const inserted = db.prepare(`INSERT INTO source_groups(platform,source_group_id,canonical_url,group_name,group_name_normalized,privacy_type,visibility_type,access_status,authorization_status,discovered_via,discovered_at,relevance_score,status,metadata_json,tags_json,created_at,updated_at) VALUES ('facebook',?,?,?,?,?,?,?,'DISCOVERED',?,?,?,'DISCOVERED',?,?,?,?)`).run(normalized.sourceGroupId, normalized.canonicalUrl, input.name || null, nameNormalized || null, input.privacyType || 'UNKNOWN', input.visibilityType || 'UNKNOWN', input.accessStatus || 'UNKNOWN', input.discoveredVia || 'manual', now, classification.relevance, JSON.stringify(input.metadata || {}), JSON.stringify(classification.tags), now, now)
-        id = Number(inserted.lastInsertRowid)
-        db.prepare('INSERT INTO source_metrics(source_group_id,updated_at) VALUES (?,?)').run(id, now)
+        try {
+          const inserted = db.prepare(`INSERT INTO source_groups(platform,source_group_id,canonical_url,group_name,group_name_normalized,privacy_type,visibility_type,access_status,authorization_status,discovered_via,discovered_at,relevance_score,status,metadata_json,tags_json,created_at,updated_at) VALUES ('facebook',?,?,?,?,?,?,?,'DISCOVERED',?,?,?,'DISCOVERED',?,?,?,?)`).run(normalized.sourceGroupId, normalized.canonicalUrl, input.name || null, nameNormalized || null, input.privacyType || 'UNKNOWN', input.visibilityType || 'UNKNOWN', input.accessStatus || 'UNKNOWN', input.discoveredVia || 'manual', now, classification.relevance, JSON.stringify(input.metadata || {}), JSON.stringify(classification.tags), now, now)
+          id = Number(inserted.lastInsertRowid)
+          created = true
+          db.prepare('INSERT INTO source_metrics(source_group_id,updated_at) VALUES (?,?)').run(id, now)
+        } catch (error) {
+          // A simultaneous request may insert the same canonical group after
+          // our initial lookup. Resolve the winning row instead of returning
+          // a transient unique-constraint error to the UI.
+          const winner = (normalized.sourceGroupId && byIdentity.get(normalized.sourceGroupId)) || byUrl.get(normalized.canonicalUrl)
+          if (!winner) throw error
+          id = winner.id
+        }
       }
       const eventSource = input.discoveredVia || 'manual'
       const eventUrl = input.evidenceUrl || normalized.canonicalUrl
       const repeated = db.prepare('SELECT 1 FROM group_discovery_events WHERE source_group_id=? AND discovered_via=? AND evidence_url=? LIMIT 1').get(id, eventSource, eventUrl)
       if (!repeated) db.prepare(`INSERT INTO group_discovery_events(source_group_id,discovered_via,evidence_text,evidence_url,metadata_json,discovered_at) VALUES (?,?,?,?,?,?)`).run(id, eventSource, input.evidenceText || classification.evidence.join(', ') || null, eventUrl, JSON.stringify(input.metadata || {}), now)
-      return this.get(id)
+      return { ...this.get(id), _created: created }
     },
     authorize(id, { authorized, reference = null, accessible = true } = {}) {
       const now = new Date().toISOString()

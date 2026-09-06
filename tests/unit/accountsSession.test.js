@@ -30,4 +30,5 @@ describe('Facebook posting account session verification', () => {
       responseStatus: 503,
     })).toMatchObject({ ready: false, sessionStatus: 'unknown' })
   })
+
 })

@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS raw_posts (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_source_post ON raw_posts(source_adapter, source_post_id) WHERE source_post_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_raw_url ON raw_posts(source_url_normalized);
 CREATE INDEX IF NOT EXISTS idx_raw_hash ON raw_posts(content_hash);
+CREATE INDEX IF NOT EXISTS idx_raw_capture_order ON raw_posts(captured_at DESC, collected_at DESC);
 
 CREATE TABLE IF NOT EXISTS raw_post_versions (
   id INTEGER PRIMARY KEY,
@@ -391,6 +392,7 @@ CREATE TABLE IF NOT EXISTS properties (
 );
 CREATE INDEX IF NOT EXISTS idx_properties_filters ON properties(project_id, transaction_type, rent_price_monthly, area_sqm, bedrooms, pet_policy);
 CREATE INDEX IF NOT EXISTS idx_properties_review ON properties(status, overall_confidence);
+CREATE INDEX IF NOT EXISTS idx_properties_owner_latest ON properties(source_role, deleted_at, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS field_evidence (
   id INTEGER PRIMARY KEY,
@@ -565,3 +567,25 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at TEXT NOT NULL,
   undo_of_event_id INTEGER REFERENCES audit_events(id)
 );
+
+-- Chat Guard records coverage only. It deliberately does not retain message
+-- bodies or build a second inbox/CRM.
+CREATE TABLE IF NOT EXISTS chat_sweeps (
+  id INTEGER PRIMARY KEY,
+  started_at TEXT NOT NULL,
+  completed_at TEXT,
+  status TEXT NOT NULL CHECK(status IN ('RUNNING','COMPLETE','INCOMPLETE','FAILED'))
+);
+CREATE TABLE IF NOT EXISTS chat_checks (
+  id INTEGER PRIMARY KEY,
+  sweep_id INTEGER NOT NULL REFERENCES chat_sweeps(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL,
+  surface TEXT NOT NULL CHECK(surface IN ('inbox','requests','spam','marketplace')),
+  status TEXT NOT NULL CHECK(status IN ('OK','EMPTY','FOUND','UNKNOWN','FAILED')),
+  checked_at TEXT NOT NULL,
+  error_code TEXT,
+  error_message TEXT,
+  UNIQUE(sweep_id, account_id, surface)
+);
+CREATE INDEX IF NOT EXISTS idx_chat_checks_sweep ON chat_checks(sweep_id, account_id, surface);
+CREATE INDEX IF NOT EXISTS idx_chat_checks_account ON chat_checks(account_id, checked_at DESC);

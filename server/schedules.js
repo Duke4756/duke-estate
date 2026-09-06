@@ -48,8 +48,9 @@ function successfulPosts() {
 
 export function isVerifiedPostResult(result = {}) {
   return result.ok === true && (
-    result.verified === 'group_card'
-    || (result.verified === 'permalink' && Boolean(result.postUrl))
+    (result.verified === 'permalink' && Boolean(result.postUrl))
+    || (result.verified === 'group_card' && result.submitted === true)
+    || (result.verified === 'facebook_api' && result.submitted === true && result.publishReceipt?.accepted === true)
   )
 }
 
@@ -188,7 +189,7 @@ export function updateSchedule(id, patch = {}) {
   const list = read()
   const i = list.findIndex((s) => s.id === id)
   if (i < 0) return null
-  for (const k of ['name', 'postSetId', 'groups', 'groupMode', 'accountId', 'runAt', 'status', 'results', 'lastRunAt', 'finishedAt', 'batchId', 'batchIndex', 'batchSize', 'source', 'autoCampaignId', 'burstId', 'burstIndex', 'burstSize', 'manualOverride']) {
+  for (const k of ['name', 'postSetId', 'groups', 'groupMode', 'accountId', 'runAt', 'status', 'results', 'lastRunAt', 'finishedAt', 'batchId', 'batchIndex', 'batchSize', 'source', 'autoCampaignId', 'ownerPromotionId', 'reusable', 'burstId', 'burstIndex', 'burstSize', 'manualOverride', 'autoRetryCount', 'autoRetryReason']) {
     if (k in patch) list[i][k] = k === 'groups' ? (patch[k] || []).filter(Boolean) : patch[k]
   }
   list[i].updatedAt = new Date().toISOString()
@@ -203,9 +204,11 @@ export function deleteSchedule(id) {
 
 export function clearAutoCampaignSchedules() {
   const schedules = read()
-  // Never remove a job while its browser is actively publishing. Everything
-  // else owned by Full Autopilot is disposable when the operator starts over.
-  const kept = schedules.filter((schedule) => schedule.source !== 'auto' || schedule.status === 'posting')
+  // Starting a new round may discard queued/failed work, but completed and
+  // unconfirmed deliveries are the permanent daily report and duplicate-post
+  // guard. Never erase that history from the dashboard.
+  const kept = schedules.filter((schedule) => schedule.source !== 'auto'
+    || ['posting', 'done', 'unconfirmed'].includes(schedule.status))
   const removed = schedules.length - kept.length
   if (removed) write(kept)
   return removed
@@ -219,16 +222,36 @@ export function recoverInterruptedSchedules() {
   let recovered = 0
   for (const schedule of list) {
     if (schedule.status !== 'posting') continue
-    schedule.status = 'failed'
+    const submitted = (schedule.results || []).some((result) => result.submitted === true)
+    const retryCount = Number(schedule.autoRetryCount || 0)
+    // runSchedule writes a submitted:true receipt immediately after clicking
+    // Post. With no such receipt, an interrupted navigation is safe to retry;
+    // with a receipt we must never publish it a second time.
+    const safeToRetry = !submitted && retryCount < 2
+    schedule.status = submitted ? 'unconfirmed' : safeToRetry ? 'pending' : 'failed'
     schedule.results = schedule.results?.length
-      ? schedule.results
-      : (schedule.groups || []).map((group) => ({
+      ? schedule.results.map((result) => submitted ? {
+          ...result,
+          pending: true,
+          submitted: true,
+          verified: result.verified || 'unconfirmed',
+          safeToResubmit: false,
+          error: result.error || 'ส่งคำสั่งโพสต์แล้ว แต่โปรแกรมถูกขัดจังหวะระหว่างตรวจหลักฐาน — ระบบจะตรวจซ้ำและไม่โพสต์ซ้ำ',
+        } : result)
+      : safeToRetry ? [] : (schedule.groups || []).map((group) => ({
           group,
           ok: false,
           error: 'การโพสต์ถูกขัดจังหวะก่อนยืนยันผล — ยังไม่ได้ถือว่าโพสต์สำเร็จ',
           at: new Date().toISOString(),
         }))
-    schedule.finishedAt = new Date().toISOString()
+    if (safeToRetry) {
+      schedule.runAt = new Date(Date.now() + 30_000).toISOString()
+      schedule.autoRetryCount = retryCount + 1
+      schedule.autoRetryReason = 'กู้คิวหลังโปรแกรม/เบราว์เซอร์ถูกขัดจังหวะก่อนกดส่งโพสต์'
+      delete schedule.finishedAt
+    } else {
+      schedule.finishedAt = new Date().toISOString()
+    }
     schedule.updatedAt = new Date().toISOString()
     recovered++
   }

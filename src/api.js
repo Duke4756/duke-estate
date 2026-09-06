@@ -4,6 +4,12 @@ export async function getHealth() {
   if (!res.ok) throw new Error(`Request failed (${res.status})`)
   return res.json() // { hasSession, gemini, groups, ... }
 }
+export async function getSystemOverview() {
+  const res = await fetch('/api/system-overview')
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(body.error || 'โหลดภาพรวมระบบไม่สำเร็จ')
+  return body
+}
 
 export async function getOwnerRulesStatus() {
   const res = await fetch('/api/owner-rules/status')
@@ -28,6 +34,7 @@ async function sourceRequest(path = '', options) {
 export const getSources = () => sourceRequest()
 export const getSourceCoverage = () => sourceRequest('/coverage')
 export const addSourceCandidate = (input) => sourceRequest('/candidates', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) })
+export const importSourceCandidates = (text) => sourceRequest('/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) })
 export const authorizeSource = (id, authorized = true) => sourceRequest(`/${id}/authorization`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ authorized, accessible: true, reference: 'database_ui' }) })
 export const setSourceStatus = (id, status) => sourceRequest(`/${id}/status`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }) })
 export const controlSourceLane = (lane, action) => sourceRequest(`/${lane}/${action}`, { method: 'POST' })
@@ -41,6 +48,15 @@ export async function getPostSets() {
   return res.json() // { postsets: [{id, name, text, images:[{file,url}], ...}] }
 }
 
+export async function previewMarketingPlan(plan) {
+  const res = await fetch('/api/marketing-plan/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plan }) })
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`)
+  return body.plan
+}
+export async function applyMarketingPlan(plan) { const res = await fetch('/api/marketing-plan/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plan }) }); const body = await res.json().catch(() => ({})); if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`); return body }
+export async function exportMarketingPlan() { const res = await fetch('/api/marketing-plan/export'); return res.json() }
+
 export async function importPostSetUrl(url) {
   const res = await fetch('/api/postsets/import-preview', {
     method: 'POST',
@@ -52,9 +68,9 @@ export async function importPostSetUrl(url) {
   return body.preview
 }
 
-export async function createPostSetFromUrl(url) {
+export async function createPostSetFromUrl(url, { propertyType, deal } = {}) {
   const res = await fetch('/api/postsets/import', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }),
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url, propertyType, deal }),
   })
   const body = await res.json().catch(() => ({}))
   if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`)
@@ -75,22 +91,22 @@ export const startJsaSession = (url) => jsaSessionRequest('/start', {
 export const finishJsaSession = () => jsaSessionRequest('/finish', { method: 'POST' })
 export const disconnectJsaSession = () => jsaSessionRequest('', { method: 'DELETE' })
 
-export async function createPostSet({ name, text, images, sourceUrl }) {
+export async function createPostSet({ name, text, images, sourceUrl, kind, propertyType, deal }) {
   const res = await fetch('/api/postsets', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, text, images, sourceUrl }),
+    body: JSON.stringify({ name, text, images, sourceUrl, kind, propertyType, deal }),
   })
   const body = await res.json().catch(() => ({}))
   if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`)
   return body.postset
 }
 
-export async function updatePostSet(id, { name, text, keepImages, newImages, imageOrder }) {
+export async function updatePostSet(id, { name, text, keepImages, newImages, imageOrder, propertyType, deal }) {
   const res = await fetch(`/api/postsets/${id}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, text, keepImages, newImages, imageOrder }),
+    body: JSON.stringify({ name, text, keepImages, newImages, imageOrder, propertyType, deal }),
   })
   const body = await res.json().catch(() => ({}))
   if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`)
@@ -155,6 +171,13 @@ export async function getAutoCampaign() {
 
 export async function getAutoCampaignStatus() {
   const res = await fetch('/api/auto-campaign/status')
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`)
+  return body
+}
+
+export async function openAutopostEvidenceFolder() {
+  const res = await fetch('/api/autopost/evidence/open-folder', { method: 'POST' })
   const body = await res.json().catch(() => ({}))
   if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`)
   return body
@@ -528,6 +551,7 @@ export async function getGroups() {
   if (!res.ok) throw new Error(`Request failed (${res.status})`)
   return res.json() // { groups: [{url, label}] }
 }
+export async function getProjects() { const res = await fetch('/api/properties/projects'); if (!res.ok) throw new Error(`Request failed (${res.status})`); return res.json() }
 
 export async function getGroupCrawlHistory() {
   const res = await fetch('/api/groups/crawl-history')
@@ -545,6 +569,15 @@ export async function saveGroups(groups) {
   const body = await res.json().catch(() => ({}))
   if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`)
   return body // { groups: [{url, label}] }
+}
+
+export async function resolveGroupNames(urls) {
+  const res = await fetch('/api/groups/resolve-names', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ urls }),
+  })
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`)
+  return body
 }
 
 export async function getKeywords() {

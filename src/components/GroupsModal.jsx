@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { getGroups, saveGroups } from '../api'
+import { getGroups, saveGroups, resolveGroupNames, getProjects } from '../api'
 import { hasGroup } from '../groupUrl'
 import { GROUP_SETS } from '../groupSets'
 
@@ -9,6 +9,9 @@ export default function GroupsModal({ open, onClose, onSaved }) {
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
+  const [resolving, setResolving] = useState(false)
+  const [projects, setProjects] = useState([])
+  const [query, setQuery] = useState('')
 
   useEffect(() => {
     if (!open) return
@@ -16,10 +19,11 @@ export default function GroupsModal({ open, onClose, onSaved }) {
     setLoading(true)
     getGroups()
       .then((d) => setItems((d.groups || []).map((g) => ({
-        url: g.url, active: g.active !== false, category: g.category || 'general', name: g.name || '',
+        url: g.url, active: g.active !== false, category: g.category || 'general', name: g.name || '', marketingTags: g.marketingTags || [], projectTags: g.projectTags || [], notes: g.notes || '',
       }))))
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
+    getProjects().then((d) => setProjects(d.projects || [])).catch(() => {})
   }, [open])
 
   if (!open) return null
@@ -38,7 +42,8 @@ export default function GroupsModal({ open, onClose, onSaved }) {
       setError('ไม่สามารถเพิ่มได้ เนื่องจากมีกลุ่มนี้อยู่แล้ว')
       return
     }
-    setItems([...items, { url: v, active: true, category: 'general', name: '' }])
+    const urls = v.split(/\s+/).filter(Boolean)
+    setItems(urls.reduce((list, url) => hasGroup(list, url) ? list : [...list, { url, active: true, category: 'general', name: '', marketingTags: [], projectTags: [], notes: '' }], items))
     setDraft('')
     setError(null)
   }
@@ -64,6 +69,17 @@ export default function GroupsModal({ open, onClose, onSaved }) {
     }
   }
 
+  async function resolveNames() {
+    setResolving(true); setError(null)
+    try {
+      const result = await resolveGroupNames(items.map((item) => item.url))
+      setItems(result.groups || items)
+      const found = (result.resolved || []).filter((item) => item.ok).length
+      setError(found ? `ตรวจพบชื่อกลุ่มแล้ว ${found} กลุ่ม` : 'ยังตรวจชื่อกลุ่มไม่ได้ กรุณาเปิด Facebook และล็อกอินก่อน')
+    } catch (e) { setError(e.message) }
+    finally { setResolving(false) }
+  }
+
   return (
     <div
       className="fixed inset-0 z-50 grid place-items-center bg-slate-900/40 p-4"
@@ -74,13 +90,15 @@ export default function GroupsModal({ open, onClose, onSaved }) {
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
-          <h2 className="text-base font-bold text-slate-800">⚙️ คลังกลุ่ม Facebook</h2>
+          <div><h2 className="text-base font-bold text-slate-800">⚙️ คลังกลุ่ม Facebook</h2><p className="mt-1 text-[11px] text-slate-400">ชื่อกลุ่มจะแสดงในหน้าตั้งค่าแทนรหัส URL</p></div>
+          <button type="button" disabled={resolving || loading || !items.length} onClick={resolveNames} className="mr-2 rounded-lg bg-indigo-50 px-3 py-1.5 text-xs font-bold text-indigo-700 disabled:opacity-50">{resolving ? 'กำลังเปิดตรวจ…' : '↻ ดึงชื่อจาก Facebook'}</button>
           <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-xl leading-none">
             ✕
           </button>
         </div>
 
         <div className="px-5 py-4 space-y-3">
+          <datalist id="project-master-options">{projects.map((project) => <option key={project.id} value={project.id}>{project.canonical_name}</option>)}</datalist><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="ค้นหากลุ่มหรือโครงการ…" className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm" />
           <p className="text-xs text-slate-400">
             คลังนี้ใช้ร่วมกันทั้งค้นหาโพสต์และโพสต์อัตโนมัติ — จัดกลุ่มเป็นชุดเพื่อเรียกใช้พร้อมกันได้
           </p>
@@ -92,7 +110,7 @@ export default function GroupsModal({ open, onClose, onSaved }) {
               {items.length === 0 && (
                 <li className="text-sm text-slate-400 py-3 text-center">ยังไม่มีกลุ่ม</li>
               )}
-              {items.map((g) => (
+              {items.filter((g) => !query || `${g.name} ${g.url} ${(g.projectTags || []).join(' ')}`.toLowerCase().includes(query.toLowerCase()) || (projects || []).some((p) => (g.projectIds || []).includes(p.id) && `${p.canonical_name} ${(p.aliases || []).join(' ')}`.toLowerCase().includes(query.toLowerCase()))).map((g) => (
                 <li
                   key={g.url}
                   className={`flex items-center justify-between gap-2 rounded-xl border px-3 py-2 transition ${
@@ -106,7 +124,10 @@ export default function GroupsModal({ open, onClose, onSaved }) {
                       placeholder={labelOf(g.url)}
                       className="mb-1 w-full bg-transparent text-sm font-medium text-slate-700 outline-none"
                     />
-                    <p className="text-[11px] text-slate-400 truncate">{g.url}</p>
+                    <p className="text-[11px] text-slate-400 truncate">{g.url}{g.memberCount ? ` · สมาชิก ${g.memberCount.toLocaleString('th-TH')} คน` : ''}</p>
+                    <input value={(g.marketingTags || []).join(',')} onChange={(e) => update(g.url, { marketingTags: e.target.value.split(',').map((x) => x.trim().toUpperCase()).filter(Boolean) })} placeholder="Tags: EXPAT,SUKHUMVIT" className="mt-1 w-full bg-transparent text-[11px] text-indigo-600 outline-none" />
+                    <input value={(g.projectTags || []).join(',')} onChange={(e) => update(g.url, { projectTags: e.target.value.split(',').map((x) => x.trim()).filter(Boolean) })} placeholder="โครงการ: Siri Residence" className="mt-1 w-full bg-transparent text-[11px] text-violet-600 outline-none" />
+                    <input list="project-master-options" value={(g.projectIds || []).join(',')} onChange={(e) => update(g.url, { projectIds: e.target.value.split(',').map((x) => x.trim()).filter(Boolean) })} placeholder="Project ID หลายรายการ" className="mt-1 w-full bg-transparent text-[11px] text-emerald-600 outline-none" />
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
                     <select

@@ -7,13 +7,13 @@ describe('concurrent account scheduler', () => {
     id, accountId, status: 'pending', runAt: new Date(now + minutes * 60_000).toISOString(),
   })
 
-  it('starts one due job for each different ready account at the same time', () => {
+  it('starts only the earliest due job globally to avoid competing browsers', () => {
     const selected = selectConcurrentDueSchedules({
       schedules: [schedule('a1', 'a'), schedule('b1', 'b'), schedule('c1', 'c')],
       now,
       readyAccountIds: ['a', 'b', 'c'],
     })
-    expect(selected.map((item) => item.id)).toEqual(['a1', 'b1', 'c1'])
+    expect(selected.map((item) => item.id)).toEqual(['a1'])
   })
 
   it('keeps the earliest job only when one account has several due jobs', () => {
@@ -22,7 +22,17 @@ describe('concurrent account scheduler', () => {
       now,
       readyAccountIds: ['a', 'b'],
     })
-    expect(selected.map((item) => item.id)).toEqual(['a-first', 'b'])
+    expect(selected.map((item) => item.id)).toEqual(['a-first'])
+  })
+
+  it('does not start another account while any publish job is active', () => {
+    const selected = selectConcurrentDueSchedules({
+      schedules: [schedule('a', 'a'), schedule('b', 'b')],
+      now,
+      readyAccountIds: ['a', 'b'],
+      runningAccountIds: ['a'],
+    })
+    expect(selected).toEqual([])
   })
 
   it('respects per-account cooldown without blocking other accounts', () => {

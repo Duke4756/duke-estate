@@ -2,6 +2,21 @@ import { chromium } from 'playwright'
 
 const MISSING_EXECUTABLE = /executable doesn't exist|browser.*not found|playwright install/iu
 const chromeFallbackTypes = new WeakSet()
+export const LOW_RESOURCE_INTERACTIVE_ARGS = [
+  '--renderer-process-limit=3',
+  '--disable-background-networking',
+  '--disable-component-update',
+  '--disable-sync',
+  '--disable-features=MediaRouter,GlobalMediaControls,OptimizationHints,Translate',
+]
+
+export async function reduceInteractiveContextLoad(context) {
+  await context.route('**/*', (route) => {
+    const type = route.request().resourceType()
+    if (type === 'media' || type === 'font') return route.abort()
+    return route.continue()
+  })
+}
 
 /**
  * Launch Playwright's bundled Chromium when available and transparently fall

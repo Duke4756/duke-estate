@@ -3,14 +3,18 @@ import { randomUUID } from 'node:crypto'
 import { createRawPostRepository } from '../db/repositories/rawPosts.js'
 import { classifyIntent } from '../pipeline/intentClassifier.js'
 import { splitPropertySegments } from '../pipeline/propertySegments.js'
+import { explicitAgentPostRole } from '../pipeline/candidateExtractor.js'
+import { classifyOwnership } from '../pipeline/ownershipClassifier.js'
 
 export class PostProcessingQueue extends EventEmitter {
-  constructor({ db, processor, staleMs = 10 * 60_000, workerId = `worker-${process.pid}-${randomUUID().slice(0, 8)}` }) {
+  constructor({ db, processor, staleMs = 10 * 60_000, workerId = `worker-${process.pid}-${randomUUID().slice(0, 8)}`, ownerOnly = false, rentOnly = false }) {
     super()
     this.db = db
     this.processor = processor
     this.staleMs = staleMs
     this.workerId = workerId
+    this.ownerOnly = ownerOnly
+    this.rentOnly = rentOnly
     this.rawPosts = createRawPostRepository(db)
     this.running = false
     this.timer = null
@@ -18,6 +22,16 @@ export class PostProcessingQueue extends EventEmitter {
   }
 
   captureAndEnqueue(input) {
+    const excludedRole = explicitAgentPostRole(input.raw_text)
+    if (excludedRole) {
+      this.emit('event', { type: 'AGENT_POST_SKIPPED', sourceUrl: input.source_url, sourcePostId: input.source_post_id, sourceRole: excludedRole })
+      return { rawPost: null, inserted: false, contentChanged: false, queued: false, excluded: true, excludedRole }
+    }
+    const capturedIntent = classifyIntent(input.raw_text).intent
+    if (this.rentOnly && (capturedIntent === 'offer_sale' || capturedIntent === 'wanted_buy')) {
+      this.emit('event', { type: 'NON_RENT_POST_SKIPPED', sourceUrl: input.source_url, sourcePostId: input.source_post_id, intent: capturedIntent })
+      return { rawPost: null, inserted: false, contentChanged: false, queued: false, excluded: true, excludedIntent: capturedIntent }
+    }
     const now = new Date().toISOString()
     const transaction = this.db.transaction(() => {
       const rawPost = this.rawPosts.upsert(input)
@@ -109,9 +123,23 @@ export class PostProcessingQueue extends EventEmitter {
     }
     this.emit('event', { type: 'CLASSIFIED', rawPostId: raw.id, classification: publicClassification, confidence: classification.confidence, evidence: classification.evidence })
     this.emit('event', { type: 'SEGMENTED', rawPostId: raw.id, listingCount: segments.length })
+    const ownership = classifyOwnership(raw.raw_text, { trustedOwnerProfile: isTrustedOwnerProfile(this.db, raw) })
+    const nonRental = this.rentOnly && !['offer_rent', 'offer_rent_and_sale'].includes(classification.intent)
+    if (this.ownerOnly && (ownership.value !== 'owner' || nonRental)) {
+      const status = nonRental ? 'NOT_RENT' : ownership.value === 'uncertain' ? 'OWNER_UNCERTAIN' : 'NOT_OWNER'
+      const summary = { classification, ownership, listingCount: segments.length, propertyIds: [] }
+      this.#finish(job, 'COMPLETED', summary)
+      this.db.prepare('UPDATE raw_posts SET ingestion_status=? WHERE id=?').run(status, raw.id)
+      this.emit('event', { type: status, rawPostId: raw.id, ownership })
+      return
+    }
     try {
       const result = await this.processor(raw)
       const status = 'COMPLETED'
+      if (result?.propertyIds?.length) {
+        const placeholders = result.propertyIds.map(() => '?').join(',')
+        this.db.prepare(`UPDATE properties SET source_role='owner',updated_at=? WHERE id IN (${placeholders})`).run(new Date().toISOString(), ...result.propertyIds)
+      }
       const summary = { classification, listingCount: segments.length, propertyIds: result?.propertyIds || [], duplicate: result?.duplicate === true, preservedUserReview: result?.preservedUserReview === true }
       this.#finish(job, status, summary)
       this.db.prepare('UPDATE raw_posts SET ingestion_status=? WHERE id=?').run(status, raw.id)
@@ -142,8 +170,14 @@ export class PostProcessingQueue extends EventEmitter {
 }
 
 function isTransient(error) { return /timeout|timed out|429|rate limit|network|fetch failed|ECONN|5\d\d/iu.test(String(error?.message || error)) }
-function classificationName(intent, text = '') { if (intent === 'co_agent_request') return 'CO_AGENT_LISTING'; if (/\bco[- ]?agent\b|ร่วมปล่อย|แบ่งคอม/iu.test(text)) return 'CO_AGENT_LISTING'; if (/\bagent\b|เอเจนต์|เอเจนท์|นายหน้า/iu.test(text) && /^offer_/u.test(intent)) return 'AGENT_LISTING'; return ({ offer_rent: 'OWNER_LISTING', offer_sale: 'OWNER_LISTING', offer_rent_and_sale: 'OWNER_LISTING', wanted_rent: 'TENANT_REQUIREMENT', wanted_buy: 'BUYER_REQUIREMENT', service_or_spam: 'NOT_PROPERTY', other: 'UNCERTAIN' })[intent] || 'UNCERTAIN' }
+function classificationName(intent, text = '') { const role = explicitAgentPostRole(text); if (role === 'co_agent' || intent === 'co_agent_request') return 'CO_AGENT_LISTING'; if (role === 'agent' && /^offer_/u.test(intent)) return 'AGENT_LISTING'; return ({ offer_rent: 'OWNER_LISTING', offer_sale: 'OWNER_LISTING', offer_rent_and_sale: 'OWNER_LISTING', wanted_rent: 'TENANT_REQUIREMENT', wanted_buy: 'BUYER_REQUIREMENT', service_or_spam: 'NOT_PROPERTY', other: 'UNCERTAIN' })[intent] || 'UNCERTAIN' }
 function ensureReview(db, rawPostId, reason) {
   const now = new Date().toISOString()
   db.prepare(`INSERT INTO review_queue(raw_post_id, property_id, reason_code, priority, created_at) SELECT ?, NULL, ?, 90, ? WHERE NOT EXISTS (SELECT 1 FROM review_queue WHERE raw_post_id=? AND property_id IS NULL AND reason_code=? AND status='open')`).run(rawPostId, reason, now, rawPostId, reason)
+}
+
+function isTrustedOwnerProfile(db, raw) {
+  if (!raw.author_profile_url) return false
+  const history = db.prepare('SELECT raw_text FROM raw_posts WHERE author_profile_url=? AND id<>? LIMIT 50').all(raw.author_profile_url, raw.id)
+  return history.some((item) => classifyOwnership(item.raw_text).value === 'owner')
 }

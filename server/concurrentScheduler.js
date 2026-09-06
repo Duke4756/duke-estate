@@ -9,7 +9,11 @@ export function selectConcurrentDueSchedules({
   const inflight = new Set(inflightIds)
   const claimedAccounts = new Set(runningAccountIds)
   const ready = new Set(readyAccountIds)
-  return [...(schedules || [])]
+  // Facebook/Chrome becomes unreliable when several isolated browser
+  // contexts navigate at once on this machine. Serialize all publishing jobs;
+  // account-specific cadence is still preserved by each schedule's runAt.
+  if (inflight.size || claimedAccounts.size) return []
+  const selected = [...(schedules || [])]
     .sort((a, b) => new Date(a.runAt).getTime() - new Date(b.runAt).getTime())
     .filter((schedule) => {
       if (schedule.status !== 'pending' || inflight.has(schedule.id)) return false
@@ -23,4 +27,5 @@ export function selectConcurrentDueSchedules({
       claimedAccounts.add(accountId)
       return true
     })
+  return selected.slice(0, 1)
 }

@@ -91,10 +91,10 @@ export function extractCandidates(rawText) {
   }
 }
 
-function extractSourceRoleCandidates(text) {
+export function extractSourceRoleCandidates(text) {
   const owners = collect(
     text,
-    /เจ้าของ(?:ห้อง|บ้าน|ทรัพย์)?\s*(?:ปล่อย(?:เช่า|ขาย)\s*)?เอง|เจ้าของโดยตรง|ปล่อย(?:เช่า|ขาย)โดยเจ้าของ|ประกาศ(?:โดย|จาก)เจ้าของ(?:ห้อง|บ้าน|ทรัพย์)?|\b(?:direct\s+)?owner(?:\s+post)?\b/giu,
+    /เจ้าของ(?:ห้อง|บ้าน|ทรัพย์)?\s*(?:(?:ปล่อย)?(?:เช่า|ขาย)\s*)?เอง|เจ้าของโดยตรง|ปล่อย(?:เช่า|ขาย)โดยเจ้าของ|ประกาศ(?:โดย|จาก)เจ้าของ(?:ห้อง|บ้าน|ทรัพย์)?|\bowner\b\s*(?:ปล่อย(?:เช่า|ขาย)|ขาย)\s*เอง|\b(?:direct\s+owner|owner\s+(?:post|listing)|by\s+owner)\b/giu,
     () => 'owner',
   )
   const agents = collect(
@@ -104,6 +104,18 @@ function extractSourceRoleCandidates(text) {
   )
   const coAgents = collect(text, /\bco[- ]?agent\s+(?:post|listing|request)\b|โพสต์ร่วม(?:เอเจนต์|นายหน้า)|ร่วมปล่อย|แบ่งคอม/giu, () => 'co_agent')
   return uniqueEvidence([...owners, ...agents, ...coAgents])
+}
+
+// Owner-only ingestion must be conservative: a sentence such as
+// "เจ้าของโพสต์เอง ไม่รับ agent" is owner evidence, not an agent post.
+// Only explicit authorship/co-broker evidence is strong enough to discard a
+// post before it reaches the raw archive and property pipeline.
+export function explicitAgentPostRole(rawText) {
+  const roles = extractSourceRoleCandidates(String(rawText || '')).map((item) => item.value)
+  if (roles.includes('owner')) return null
+  if (roles.includes('co_agent')) return 'co_agent'
+  if (roles.includes('agent')) return 'agent'
+  return null
 }
 
 function extractGenericMoney(text) {
@@ -160,8 +172,12 @@ function hasMoneyEvidence(quote) {
 }
 
 function extractProjectCandidates(text) {
-  const forbidden = /^(?:เลี้ยงสัตว์ได้|รับสัตว์เลี้ยง|ห้องสวย|พร้อมอยู่|ราคาดี|ใกล้\s*(?:bts|mrt)|ทองหล่อ|สุขุมวิท)$/iu
+  const forbidden = /^(?:เลี้ยงสัตว์ได้|รับสัตว์เลี้ยง|ห้องสวย|พร้อมอยู่|ราคาดี|ใกล้\s*(?:bts|mrt))$/iu
   const patterns = [
+    // Strong labelled fields can appear anywhere in the post and are safer
+    // than assuming the first line is a project name.
+    /(?:ชื่อโครงการ|ชื่อคอนโด|project\s*name|condo\s*name)\s*[:：=-]\s*([^\n|•]{2,100})/gimu,
+    /(?:ให้เช่า|ปล่อยเช่า|for\s+(?:rent|sale))\s+([^\n|•]{2,100}?)\s+(?=ดู(?:เพิ่มเติม|น้อยลง))/gimu,
     // A standalone first line is not evidence of a project name. Facebook
     // posts commonly start with language labels, agent notes, or promotional
     // copy. Require a project/property context or a structured heading.
@@ -212,11 +228,11 @@ function extractProjectCandidates(text) {
 }
 
 function cleanProjectCandidate(raw) {
-  return String(raw || '')
+  const cleaned = String(raw || '')
     .trim()
     .replace(/\s{2,}/g, ' ')
     .replace(/\s*\|.*$/u, '')
-    .replace(/\s*\.{2,}\s*(?:ดูเพิ่มเติม|ดูน้อยลง).*$/iu, '')
+    .replace(/\s*(?:\.{2,}\s*)?(?:ดูเพิ่มเติม|ดูน้อยลง).*$/iu, '')
     .replace(/\s+(?:by|จาก)\s+[\p{L}\p{N} .&'-]+$/iu, '')
     .replace(/\s*\((?:pet[- ]?friendly|เลี้ยงสัตว์ได้)[^)]*\)\s*$/iu, '')
     .replace(/\s+#(?:PF)?\d+\b.*$/iu, '')
@@ -238,6 +254,16 @@ function cleanProjectCandidate(raw) {
     .replace(/^คอนโด\s+/iu, '')
     .replace(/^[#|:：–—-]+\s*|\s*[|:：–—-]+$/gu, '')
     .trim()
+  return collapseRepeatedProjectName(cleaned)
+}
+
+function collapseRepeatedProjectName(value) {
+  const words = String(value).split(/\s+/).filter(Boolean)
+  if (words.length < 4 || words.length % 2 !== 0) return value
+  const middle = words.length / 2
+  return words.slice(0, middle).join(' ').toLocaleLowerCase() === words.slice(middle).join(' ').toLocaleLowerCase()
+    ? words.slice(0, middle).join(' ')
+    : value
 }
 
 export function isGenericProjectCandidate(value) {
@@ -250,14 +276,16 @@ export function isGenericProjectCandidate(value) {
   if (/^(?:brand\s+new\b|for\s+(?:rent|sale)|เลี้ยงสัตว์|ห้อง|พร้อม|ราคา|ใกล้|ชั้น|\d)/iu.test(value)) return true
   if (/^(?:home(?:\s|$)|house(?:\s|$)|chat(?:\s|$)|foreigner\s+welcome|maid(?:[’']s)?\s+room|location\s*:|highlights?(?:\s|$)|property\s+details?(?:\s|$))/iu.test(normalized)) return true
   if (/^(?:หาก|กรณี|หมายเหตุ|เงื่อนไข|รายละเอียด|ทำเล|ข้อมูลทรัพย์|ซอย)/u.test(normalized)) return true
+  if (/^(?:สถานที่ใกล้|สถานที่สำคัญ|สิ่งอำนวยความสะดวก|จุดเด่น)/u.test(normalized)) return true
+  if (/^(?:อสังหาริมทรัพย์ให้เช่า|คอนโด(?:ย่าน)?(?:สุขุมวิท|พระราม\s*9|อโศก|ลาดพร้าว|สำโรง)|ให้ชาวต่างชาติ|รับโคagent)$/iu.test(normalized)) return true
   if (/\b(?:inspired apartment|in the heart of|ready to move|welcome pets?)\b/iu.test(value) && !/\b(?:residence|condo|tower|place|park|maestro|ideo|metris|life|origin)\b/iu.test(value)) return true
   if (!/\p{L}/u.test(normalized)) return true
-  if (/^(?:for|rent|rental(?:\s*\(baht\))?|sale|price|location|type|code|available|now|agent\s+post|property\s+details|highlights?|hot\s+(?:deal|unit)|condo|stu|คอนโด|ประกอบด้วย|รับต่างชาติ|โครงการ)$/iu.test(normalized)) return true
-  if (/^#|(?:#\p{L}[\p{L}\p{M}\p{N}_-]*\s*){2,}$/u.test(value)) return true
+  if (/^(?:for|rent|rental(?:\s*\(baht\))?|sale|price|location|type|code|available|now|agent\s+post|property\s+details|highlights?|hot\s+(?:deal|unit)|corner\s+unit|duplex|loft|penthouse|studio|condo|stu|คอนโด|ประกอบด้วย|รับต่างชาติ|โครงการ)$/iu.test(normalized)) return true
+  if (/#|ดู(?:เพิ่มเติม|น้อยลง)|(?:#\p{L}[\p{L}\p{M}\p{N}_-]*\s*){2,}$/u.test(value)) return true
   if (/(?:บาท|thb|usd|\/\s*month|\/\s*เดือน|\d[\d,.]*\s*(?:ตร\.?\s*ม|sqm|bedroom|ห้องนอน))/iu.test(normalized)) return true
   if (/^(?:pet[- ]?friendly|cat[- ]?friendly|luxury|beautiful|ready|next\s+to|located|looking|fully\s+furnished|new(?:ly)?\b|owner\b|spacious\b)\b/iu.test(normalized)) return true
   if (/^(?:bts|mrt|arl)\b/iu.test(normalized)) return true
-  if (/^[•*#]|(?:contact|line|โทร|สนใจ|รายละเอียด|เฟอร์นิเจอร์|เครื่องใช้ไฟฟ้า)\b/iu.test(normalized)) return true
+  if (/^(?:[•*#]|contact\b|line\s*[:@]|โทร\b|สนใจ\b|รายละเอียด\b|เฟอร์นิเจอร์\b|เครื่องใช้ไฟฟ้า\b)/iu.test(normalized)) return true
   return false
 }
 

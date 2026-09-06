@@ -15,14 +15,16 @@ import 'dotenv/config'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { deleteSet, getSet, IMAGES_DIR } from './postsets.js'
-import { eligibleGroups, isOneTimePostComplete, listSchedules, rotateGroupsForAccount, scheduleStatusForResults, updateSchedule } from './schedules.js'
-import { removeAutoCampaignPostSets } from './autoCampaigns.js'
+import { getSet, IMAGES_DIR, isPublishableRentalPostSet } from './postsets.js'
+import { eligibleGroups, listSchedules, rotateGroupsForAccount, scheduleStatusForResults, updateSchedule } from './schedules.js'
 import { preparePostText } from './postText.js'
-import { facebookPostPermalink, postVerificationMarkers } from './facebookPostMatch.js'
+import { facebookPostPermalink, isPostCardRecent, postVerificationMarkers } from './facebookPostMatch.js'
+import { facebookCreatePostMutation, facebookGraphqlFriendlyName, parseFacebookPublishReceipt } from './facebookPublishReceipt.js'
 import { filterPostableGroups, saveGroupMembership, saveGroupMemberships } from './groupMembershipStore.js'
 import { isMembershipUnavailableError, shouldTryNextRandomGroup } from './postingGroupFallback.js'
 import { launchBrowser } from './browserLauncher.js'
+import { accountBrowserState, tryAcquireAccount } from './browserBroker.js'
+import { autopostReliability, classifyPostingError } from './autopostReliability.js'
 import {
   accountSessionPath,
   accountSessionReady,
@@ -32,11 +34,17 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const SESSION_PATH = process.env.FB_SESSION_PATH || path.join(__dirname, 'fb-session.json')
+export const POST_EVIDENCE_DIR = path.join(__dirname, 'autopost', 'evidence')
 // Posting normally runs without showing a Chrome window. Set
 // POSTER_HEADLESS=false only when diagnosing a Facebook layout/change.
 const HEADLESS = process.env.POSTER_HEADLESS !== 'false'
 const DEBUG = process.env.DEBUG_POSTER === '1'
 const SESSION_EXPIRED_MESSAGE = 'session Facebook หมดอายุ — ไปที่ “โพสต์อัตโนมัติ > บัญชีโพสต์” แล้วกด “ล็อกอินใหม่” ที่บัญชีนี้'
+const IMMEDIATE_VERIFICATION_MS = Math.max(60_000, Number(process.env.POST_IMMEDIATE_VERIFY_MS) || 3 * 60_000)
+// A Facebook tab can remain alive forever after macOS/network interruptions.
+// Never let one run hold an account lock indefinitely. This wall-clock limit
+// includes navigation, publishing and immediate verification.
+const POST_RUN_TIMEOUT_MS = Math.max(5 * 60_000, Number(process.env.POST_RUN_TIMEOUT_MS) || 15 * 60_000)
 
 export function canPost() {
   return listAccounts().some((account) => account.ready)
@@ -46,7 +54,9 @@ export function canPost() {
 // concurrently. Keep a strict lock within each individual account.
 const runningAccountIds = new Set()
 export function isPosting(accountId) {
-  return accountId ? runningAccountIds.has(accountId) : runningAccountIds.size > 0
+  return accountId
+    ? runningAccountIds.has(accountId) || accountBrowserState(accountId).state !== 'IDLE'
+    : runningAccountIds.size > 0
 }
 
 // Same browser + context setup as server/scraper.js (storageState = saved FB
@@ -204,7 +214,8 @@ async function openComposerWithRecovery(page, groupUrl, label) {
       await assertLoggedIn(page)
       await assertCanPostToGroup(page, label)
       if (attempt === 0) {
-        await page.goto(groupUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
+        await page.goto(groupUrl, { waitUntil: 'commit', timeout: 45000 })
+        await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {})
         await page.waitForTimeout(4000)
       }
     }
@@ -310,11 +321,165 @@ async function matchingPostCardCount(page, text) {
   return page.locator('[role="article"]').filter({ hasText: marker }).count().catch(() => 0)
 }
 
-async function findPublishedPost(page, text, linksBefore, matchingCardsBefore, groupUrl) {
+function bangkokDateParts(at = new Date()) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(at).filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]))
+  return { day: `${parts.year}-${parts.month}-${parts.day}`, time: `${parts.hour}-${parts.minute}-${parts.second}` }
+}
+
+async function capturePostEvidence(card, evidence = {}) {
+  const attemptId = typeof evidence === 'string' ? evidence : evidence.attemptId
+  if (!attemptId || !card) return null
+  try {
+    const { day, time } = bangkokDateParts()
+    // One delivery folder per day, containing images only. Keep the filename
+    // to the capture time and date, per the report format.
+    const dir = path.join(POST_EVIDENCE_DIR, day)
+    const [year, month, date] = day.split('-')
+    const basename = `${time}_${date}-${month}-${year}`
+    fs.mkdirSync(dir, { recursive: true })
+    const screenshotPath = path.join(dir, `${basename}.png`)
+    if (evidence.clip) {
+      await card.page().screenshot({ path: screenshotPath, clip: evidence.clip, animations: 'disabled' })
+    } else {
+      await card.screenshot({ path: screenshotPath, animations: 'disabled' })
+    }
+    return `/api/autopost/evidence/${day}/${encodeURIComponent(basename)}.png`
+  } catch {
+    return null
+  }
+}
+
+async function captureFullPermalinkPost(page, postUrl, reference, evidence = {}) {
+  if (!postUrl) return null
+  const proofPage = await page.context().newPage()
+  try {
+    const candidates = [postUrl]
+    const ids = String(postUrl).match(/facebook\.com\/groups\/([^/]+)\/(?:posts|permalink|pending_posts)\/(\d+)/i)
+    if (ids) {
+      candidates.push(`https://www.facebook.com/groups/${ids[1]}/posts/${ids[2]}/`)
+      candidates.push(`https://www.facebook.com/groups/${ids[1]}/permalink/${ids[2]}/`)
+    }
+    for (const candidate of [...new Set(candidates)]) {
+      await proofPage.goto(candidate, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {})
+      // Facebook renders the permalink article and its media lazily. Poll for
+      // the exact property reference instead of taking a group-feed screenshot
+      // after a fixed three-second delay.
+      const article = proofPage.locator('[role="article"]').filter({ hasText: reference || '' }).first()
+      await article.waitFor({ state: 'visible', timeout: 30000 }).catch(() => {})
+      if ((await article.count()) === 0 || !(await article.isVisible().catch(() => false))) continue
+      await article.scrollIntoViewIfNeeded().catch(() => {})
+      const more = article.getByText(/^(?:ดูเพิ่มเติม|See more)$/i).first()
+      if (await more.isVisible().catch(() => false)) await more.click().catch(() => {})
+      // Permalinks are often rendered inside a modal whose article/ancestor is
+      // exactly one viewport tall (commonly 807px) with overflow scrolling.
+      // A normal element screenshot then captures only that visible slice.
+      // Expand only the article's local scroll containers (never body/html) so
+      // its bounding box represents the complete post before measuring it.
+      const expandPostContainers = () => article.evaluate((element) => {
+        let node = element
+        let depth = 0
+        while (node && node !== document.body && node !== document.documentElement && depth < 8) {
+          const scrollHeight = node.scrollHeight
+          const clientHeight = node.clientHeight
+          if (scrollHeight > clientHeight + 8 && scrollHeight < 30000) {
+            node.style.setProperty('height', `${scrollHeight}px`, 'important')
+            node.style.setProperty('max-height', 'none', 'important')
+            node.style.setProperty('overflow', 'visible', 'important')
+            node.style.setProperty('overflow-y', 'visible', 'important')
+          }
+          node = node.parentElement
+          depth += 1
+        }
+      }).catch(() => {})
+      await expandPostContainers()
+      // Facebook lazy-loads media below the fold. Walk through the complete
+      // article once so every photo receives a real size before calculating
+      // the evidence boundary, then return to the post header.
+      let preloadBox = await article.boundingBox()
+      if (preloadBox) {
+        const scrollState = await proofPage.evaluate(() => ({ x: scrollX, y: scrollY, viewport: innerHeight }))
+        const articleTop = preloadBox.y + scrollState.y
+        const articleBottom = articleTop + preloadBox.height
+        const step = Math.max(400, Math.floor(scrollState.viewport * 0.7))
+        for (let position = articleTop; position < articleBottom; position += step) {
+          await proofPage.evaluate((y) => scrollTo(0, y), position)
+          await proofPage.waitForTimeout(250)
+        }
+        await proofPage.evaluate((y) => scrollTo(0, y), articleTop)
+        await proofPage.waitForTimeout(500)
+      }
+      await article.locator('img').evaluateAll(async (images) => {
+        await Promise.all(images.map((image) => image.complete
+          ? Promise.resolve()
+          : new Promise((resolve) => {
+            image.addEventListener('load', resolve, { once: true })
+            image.addEventListener('error', resolve, { once: true })
+            setTimeout(resolve, 15000)
+          })))
+      }).catch(() => {})
+      // Image decode and Facebook's responsive collage can change the article
+      // height more than once. Re-expand and wait until two consecutive
+      // measurements agree instead of relying on a fixed delay.
+      let previousHeight = 0
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        await expandPostContainers()
+        await proofPage.waitForTimeout(500)
+        const height = await article.evaluate((element) => Math.max(element.scrollHeight, element.getBoundingClientRect().height)).catch(() => 0)
+        if (height > 0 && Math.abs(height - previousHeight) < 3) break
+        previousHeight = height
+      }
+      const articleText = await article.innerText().catch(() => '')
+      if (reference && !articleText.includes(reference)) continue
+      const articleBox = await article.boundingBox()
+      if (!articleBox) continue
+      const pageOffset = await proofPage.evaluate(() => ({ x: scrollX, y: scrollY }))
+      // Facebook sometimes nests the next-feed placeholder inside the same
+      // article container. End the proof at the real post's comment box (or,
+      // as a fallback, its final loaded image) so no grey/black tail is saved.
+      const commentBoxes = await article.locator('[role="textbox"], [contenteditable="true"]')
+        .evaluateAll((nodes) => nodes.map((node) => {
+          const rect = node.getBoundingClientRect()
+          return rect.width > 0 && rect.height > 0 ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height } : null
+        }).filter(Boolean)).catch(() => [])
+      const imageBoxes = await article.locator('img').evaluateAll((nodes) => nodes.map((node) => {
+        const rect = node.getBoundingClientRect()
+        return rect.width > 120 && rect.height > 80 ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height } : null
+      }).filter(Boolean)).catch(() => [])
+      const meaningfulBoxes = commentBoxes.length ? commentBoxes : imageBoxes
+      const contentBottom = meaningfulBoxes.length
+        ? Math.max(...meaningfulBoxes.map((box) => box.y + box.height)) + 20
+        : articleBox.y + articleBox.height
+      const clipBottom = Math.min(articleBox.y + articleBox.height, contentBottom)
+      const clip = {
+        // boundingBox/getBoundingClientRect are viewport-relative, whereas a
+        // page screenshot clip is document-relative. Omitting this offset was
+        // the reason evidence started halfway through the post after scrolling.
+        x: Math.max(0, articleBox.x + pageOffset.x),
+        y: Math.max(0, articleBox.y + pageOffset.y),
+        width: articleBox.width,
+        height: Math.max(1, clipBottom - articleBox.y),
+      }
+      return await capturePostEvidence(article, {
+        ...evidence, reference, postUrl: candidate, captureType: 'full_permalink_post', clip,
+      })
+    }
+    return null
+  } catch {
+    return null
+  } finally {
+    await proofPage.close().catch(() => {})
+  }
+}
+
+async function findPublishedPost(page, text, linksBefore, matchingCardsBefore, groupUrl, evidence = {}) {
+  const verificationDeadline = Date.now() + IMMEDIATE_VERIFICATION_MS
   const markers = postVerificationMarkers(text)
   const uniqueReference = markers.find((marker) => /\b[A-Z]{1,8}-\d{3,}\b/i.test(marker))
 
-  const findInMatchingCards = async ({ allowUnlinked = true } = {}) => {
+  const findInMatchingCards = async ({ allowUnlinked = true, requireRecent = false } = {}) => {
     for (const marker of markers) {
       const cards = page.locator('[role="article"]').filter({ hasText: marker })
       for (let index = 0; index < await cards.count(); index += 1) {
@@ -323,17 +488,31 @@ async function findPublishedPost(page, text, linksBefore, matchingCardsBefore, g
           .locator('a[href]')
           .evaluateAll((anchors) => anchors.map((anchor) => anchor.href))
           .catch(() => [])
-        const matchedLink = facebookPostPermalink(hrefs, groupUrl)
+        // Photo upload links (`set=pcb`) exist inside drafts/composers before
+        // Facebook creates a post. They must never be promoted to a success
+        // permalink by the poster verifier.
+        const matchedLink = facebookPostPermalink(hrefs, groupUrl, { allowPhotoFallback: false })
         if (matchedLink && !linksBefore.has(matchedLink)) {
-          return { foundInGroup: true, postUrl: matchedLink }
+          const markerToVerify = uniqueReference || marker
+          if (await permalinkContainsMarker(page, matchedLink, markerToVerify)) {
+            return { foundInGroup: true, postUrl: matchedLink, evidenceUrl: await captureFullPermalinkPost(page, matchedLink, uniqueReference || marker, { ...evidence, reference: uniqueReference || marker, groupUrl, postUrl: matchedLink }) }
+          }
         }
         // When no canonical URL is exposed, accept only a freshly timestamped
         // group card. The exact property reference is required when available;
         // this prevents another new post in a busy group from being matched.
         const cardText = await card.innerText().catch(() => '')
-        const recent = /(?:เมื่อสักครู่|เพิ่งโพสต์|ไม่กี่วินาที|just now|a few seconds|^|\s)1\s*(?:นาที|min(?:ute)?)(?:\s|$)/i.test(cardText)
-        if (allowUnlinked && recent && (!uniqueReference || marker === uniqueReference) && await cards.count() > matchingCardsBefore) {
-          return { foundInGroup: true, postUrl: null }
+        const recent = /(?:เมื่อสักครู่|เพิ่งโพสต์|ไม่กี่วินาที|just now|a few seconds|^|\s)\d{1,2}\s*(?:นาที|min(?:ute)?s?)(?:\s|$)/i.test(cardText)
+        const countIncreased = await cards.count() > matchingCardsBefore
+        const exactNewReference = Boolean(uniqueReference && marker === uniqueReference && countIncreased)
+        if (allowUnlinked && countIncreased && ((!requireRecent && exactNewReference) || recent)) {
+          // A fresh matching article is no longer a composer draft. Facebook
+          // often exposes the real post id only through its photo `set=pcb`
+          // links, so this fallback is safe only after all three checks above.
+          const photoPermalink = facebookPostPermalink(hrefs, groupUrl, { allowPhotoFallback: true })
+          if (!photoPermalink || await permalinkContainsMarker(page, photoPermalink, uniqueReference || marker)) {
+            return { foundInGroup: true, postUrl: photoPermalink, evidenceUrl: await captureFullPermalinkPost(page, photoPermalink, uniqueReference || marker, { ...evidence, reference: uniqueReference || marker, groupUrl, postUrl: photoPermalink }) }
+          }
         }
       }
     }
@@ -342,7 +521,7 @@ async function findPublishedPost(page, text, linksBefore, matchingCardsBefore, g
 
   // A large photo set can take a while to appear in the group feed after the
   // composer reports completion, especially on a fresh Facebook session.
-  for (let attempt = 0; attempt < 20; attempt++) {
+  for (let attempt = 0; attempt < 20 && Date.now() < verificationDeadline; attempt++) {
     const matchedLink = await findInMatchingCards()
     if (matchedLink) return matchedLink
     // A newly seen link is only valid for an image-only post.  With text, a
@@ -374,11 +553,18 @@ async function findPublishedPost(page, text, linksBefore, matchingCardsBefore, g
       searchUrl.search = ''
       searchUrl.searchParams.set('q', uniqueReference)
       await page.goto(searchUrl.toString(), { waitUntil: 'domcontentloaded', timeout: 60000 })
-      for (let attempt = 0; attempt < 12; attempt += 1) {
-        const matchedLink = await findInMatchingCards({ allowUnlinked: false })
+      let attempt = 0
+      while (Date.now() < verificationDeadline) {
+        const matchedLink = await findInMatchingCards({ allowUnlinked: true, requireRecent: true })
         if (matchedLink) return matchedLink
-        if (attempt === 5) await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {})
-        await page.waitForTimeout(1500)
+        // Facebook group search is eventually consistent. Keep this same
+        // browser/session alive and finish verification now instead of handing
+        // the uncertainty to a long-running background queue.
+        if (attempt > 0 && attempt % 8 === 0) {
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {})
+        }
+        attempt += 1
+        await page.waitForTimeout(Math.min(2000, Math.max(0, verificationDeadline - Date.now())))
       }
     } catch {
       // Preserve the submitted/manual-tracking fallback if Facebook search is
@@ -386,6 +572,21 @@ async function findPublishedPost(page, text, linksBefore, matchingCardsBefore, g
     }
   }
   return { foundInGroup: false, postUrl: null }
+}
+
+async function permalinkContainsMarker(page, permalink, marker) {
+  if (!permalink || !marker) return false
+  const verificationPage = await page.context().newPage()
+  try {
+    await verificationPage.goto(permalink, { waitUntil: 'domcontentloaded', timeout: 60000 })
+    await verificationPage.waitForTimeout(2000)
+    const text = await verificationPage.locator('body').innerText().catch(() => '')
+    return text.includes(marker)
+  } catch {
+    return false
+  } finally {
+    await verificationPage.close().catch(() => {})
+  }
 }
 
 async function waitForEnabledPostButton(page, postBtn) {
@@ -409,9 +610,43 @@ async function waitForEnabledPostButton(page, postBtn) {
   throw new Error('ปุ่มโพสต์ยังไม่พร้อมใช้งาน — รูปอาจอัปโหลดไม่เสร็จ')
 }
 
+function watchFacebookPublishReceipt(page, groupUrl) {
+  let settled = false
+  let resolveReceipt
+  const diagnostics = []
+  const promise = new Promise((resolve) => { resolveReceipt = resolve })
+  const finish = (value) => {
+    if (settled) return
+    settled = true
+    page.off('response', onResponse)
+    resolveReceipt(value)
+  }
+  const onResponse = async (response) => {
+    try {
+      const request = response.request()
+      if (!/facebook\.com\/(?:api\/)?graphql/i.test(response.url()) || request.method() !== 'POST') return
+      const postData = request.postData() || ''
+      const friendlyName = facebookGraphqlFriendlyName(postData)
+      const expectedCreate = facebookCreatePostMutation(response.url(), postData)
+      const responseText = response.status() === 200 ? await response.text() : ''
+      diagnostics.push({ friendlyName: friendlyName || 'unknown', status: response.status(), expectedCreate: Boolean(expectedCreate), at: new Date().toISOString() })
+      if (diagnostics.length > 50) diagnostics.shift()
+      if (response.status() !== 200) return
+      // Inspect response structure as well as the request name. Facebook can
+      // assign a different friendly name to each account/layout experiment.
+      const receipt = parseFacebookPublishReceipt(responseText, groupUrl, friendlyName)
+      if (receipt) finish({ ...receipt, receivedAt: new Date().toISOString() })
+    } catch {
+      // Another response or the DOM verifier can still confirm the post.
+    }
+  }
+  page.on('response', onResponse)
+  return { promise, diagnostics, stop: () => finish(null) }
+}
+
 // Click the Post button, wait for Facebook's UI acknowledgement, then verify
 // that the post actually appeared in the feed.  Returns its permalink only.
-async function submitAndWait(page, dialog, text, groupUrl) {
+async function submitAndWait(page, dialog, text, groupUrl, evidence = {}, onSubmitted = () => {}) {
   const root = dialog || page
   // Do NOT use an instant .count() check — right after attaching images FB
   // re-renders the composer, so the Post button can appear a moment later.
@@ -436,7 +671,16 @@ async function submitAndWait(page, dialog, text, groupUrl) {
   const linksBefore = new Set(await visiblePostLinks(page).catch(() => []))
   const matchingCardsBefore = await matchingPostCardCount(page, text)
   await page.waitForTimeout(500)
-  await postBtn.click()
+  const receiptWatcher = watchFacebookPublishReceipt(page, groupUrl)
+  try {
+    await postBtn.click()
+    // Persist this boundary immediately. If macOS, Chrome, or the watchdog
+    // interrupts verification afterwards, recovery must never submit again.
+    onSubmitted()
+  } catch (error) {
+    receiptWatcher.stop()
+    throw error
+  }
 
   const postError = page
     .getByText(/ไม่สามารถโพสต์|โพสต์ไม่สำเร็จ|เกิดข้อผิดพลาด|couldn['’]t post|failed to post|something went wrong/i)
@@ -474,35 +718,88 @@ async function submitAndWait(page, dialog, text, groupUrl) {
     if (!settled) throw new Error('ไม่ยืนยันได้ว่า Facebook รับโพสต์แล้ว (timeout)')
   }
   if ((await postError.count()) > 0 && (await postError.isVisible().catch(() => false))) {
+    receiptWatcher.stop()
     throw new Error(`Facebook ปฏิเสธการโพสต์: ${(await postError.innerText().catch(() => '')).trim() || 'ไม่ทราบสาเหตุ'}`)
+  }
+
+  // Primary truth: Facebook's own create-post GraphQL response. This arrives
+  // immediately and is independent of feed virtualization/search indexing.
+  const publishReceipt = await Promise.race([
+    receiptWatcher.promise,
+    page.waitForTimeout(5000).then(() => null),
+  ])
+  receiptWatcher.stop()
+  if (publishReceipt?.accepted) {
+    const reference = postVerificationMarkers(text).find((marker) => /\b[A-Z]{1,8}-\d{3,}\b/i.test(marker)) || null
+    const evidenceDetails = { ...evidence, reference, groupUrl, postUrl: publishReceipt.postUrl, publishReceipt }
+    // Only the actual permalink article is valid delivery evidence. A viewport
+    // of the group feed can be captured too early and must not be reported as
+    // proof of the post.
+    const evidenceUrl = await captureFullPermalinkPost(page, publishReceipt.postUrl, reference, evidenceDetails)
+    return {
+      postUrl: publishReceipt.postUrl,
+      evidenceUrl,
+      verified: 'facebook_api',
+      publishReceipt,
+    }
   }
 
   // The authoritative check is the matching post card inside this group. The
   // permalink is optional metadata because Facebook does not expose it in all
   // feed variants.
-  const published = await findPublishedPost(page, text, linksBefore, matchingCardsBefore, groupUrl)
+  const published = await findPublishedPost(page, text, linksBefore, matchingCardsBefore, groupUrl, evidence)
+  const reference = postVerificationMarkers(text).find((marker) => /\b[A-Z]{1,8}-\d{3,}\b/i.test(marker)) || null
+  const diagnosticEvidenceUrl = published.foundInGroup ? null : await capturePostEvidence(page, {
+    ...evidence, reference, groupUrl, publishDiagnostics: receiptWatcher.diagnostics,
+    captureType: 'verification_failure_viewport',
+  })
   return {
     postUrl: published.postUrl,
+    evidenceUrl: published.evidenceUrl || diagnosticEvidenceUrl || null,
+    publishDiagnostics: receiptWatcher.diagnostics,
     verified: published.foundInGroup ? (published.postUrl ? 'permalink' : 'group_card') : 'unconfirmed',
   }
 }
 
 // Post one set to one group. Returns { ok, error }. onStep(msg) reports progress.
-async function postToGroup(context, groupUrl, { text, imagePaths }, onStep = () => {}) {
+async function postToGroup(context, groupUrl, { text, imagePaths }, onStep = () => {}, audit = () => {}, evidence = {}) {
   const label = groupLabel(groupUrl)
   const page = await context.newPage()
   try {
     onStep(`เปิดกลุ่ม ${label}...`)
-    await page.goto(groupUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
+    audit('GROUP_NAVIGATION_STARTED')
+    // Waiting for Facebook's full DOMContentLoaded is brittle: background
+    // resources can keep it pending even though the group is already usable.
+    // Require a committed navigation, then give the DOM a bounded grace
+    // period. Retry once only here, before any composer submission is made.
+    let navigationError = null
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await page.goto(groupUrl, { waitUntil: 'commit', timeout: 45000 })
+        await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {})
+        navigationError = null
+        break
+      } catch (error) {
+        navigationError = error
+        if (attempt < 2) {
+          onStep(`Facebook โหลดกลุ่มช้า · ลองเปิดใหม่อีกครั้ง...`)
+          await page.waitForTimeout(3000)
+        }
+      }
+    }
+    if (navigationError) throw navigationError
     await page.waitForTimeout(2500)
 
     // Public groups can remain at /groups/... while serving a logged-out
     // preview, so URL-only checks are insufficient.
     await assertLoggedIn(page)
+    audit('SESSION_VERIFIED')
     await assertCanPostToGroup(page, label)
+    audit('GROUP_ACCESS_VERIFIED')
 
     onStep(`เปิดช่องเขียนโพสต์...`)
     const dialog = await openComposerWithRecovery(page, groupUrl, label)
+    audit('COMPOSER_OPENED')
 
     if (text && text.trim()) {
       onStep(`พิมพ์ข้อความ...`)
@@ -512,23 +809,31 @@ async function postToGroup(context, groupUrl, { text, imagePaths }, onStep = () 
       await page.waitForTimeout(300)
       // type char-by-char: FB's draftjs editor ignores direct DOM/fill() writes.
       await page.keyboard.type(text, { delay: 5 })
+      audit('CONTENT_ENTERED')
     }
 
     if (imagePaths.length) {
       onStep(`แนบรูป ${imagePaths.length} รูป...`)
       await attachImages(page, dialog, imagePaths)
+      audit('MEDIA_UPLOADED', { imageCount: imagePaths.length })
     }
 
     onStep(`กดโพสต์ และรอยืนยัน...`)
-    const submitted = await submitAndWait(page, dialog, text, groupUrl)
+    audit('SUBMIT_STARTED')
+    const submitted = await submitAndWait(page, dialog, text, groupUrl, evidence, () => audit('SUBMIT_CLICKED'))
     if (submitted.verified === 'unconfirmed') {
-      onStep(`⚠️ ${label}: ยังไม่พบการ์ดโพสต์ที่ตรงกันในกลุ่ม · ลองกลุ่มถัดไป`)
+      onStep(`⚠️ ${label}: Facebook รับคำสั่งแล้ว แต่ยืนยันโพสต์ไม่สำเร็จภายใน ${Math.ceil(IMMEDIATE_VERIFICATION_MS / 60_000)} นาที · ไม่โพสต์ซ้ำ`)
       return {
         ok: false,
         pending: true,
-        error: 'Facebook ปิดหน้าต่างเขียนโพสต์แล้ว แต่ยังไม่พบการ์ดโพสต์ของห้องนี้ในกลุ่ม',
+        submitted: true,
+        verificationExpired: true,
+        verificationVersion: 4,
+        error: `Facebook รับคำสั่งโพสต์แล้ว แต่ระบบตรวจไม่พบการ์ดที่มีรหัสทรัพย์ภายใน ${Math.ceil(IMMEDIATE_VERIFICATION_MS / 60_000)} นาที — ต้องเปิดกลุ่มตรวจครั้งเดียว ระบบจะไม่โพสต์ซ้ำ`,
         postUrl: null,
-        verified: 'unconfirmed',
+        evidenceUrl: submitted.evidenceUrl || null,
+        publishDiagnostics: submitted.publishDiagnostics || [],
+        verified: submitted.verified || 'unconfirmed',
       }
     }
     if (DEBUG) {
@@ -537,8 +842,8 @@ async function postToGroup(context, groupUrl, { text, imagePaths }, onStep = () 
       await page.screenshot({ path: path.join(dir, `post-success-${label}.png`) })
       fs.writeFileSync(path.join(dir, `post-success-${label}.html`), await page.content())
     }
-    onStep(`✅ ${label}: พบโพสต์ของห้องนี้ในกลุ่มแล้ว`)
-    return { ok: true, error: null, ...submitted }
+    onStep(`✅ ${label}: พบโพสต์ของห้องนี้ในกลุ่มแล้ว${submitted.postUrl ? '' : ' (Facebook ซ่อน permalink)'}`)
+    return { ok: true, pending: false, submitted: true, error: null, ...submitted }
   } catch (e) {
     if (DEBUG) {
       const dir = path.join(process.cwd(), 'scratch-debug')
@@ -575,6 +880,14 @@ export async function runSchedule(scheduleId, { onStep = () => {} } = {}) {
     updateSchedule(scheduleId, { status: 'failed' })
     throw new Error('ชุดโพสต์ถูกลบไปแล้ว — ไม่สามารถโพสต์ได้')
   }
+  if (schedule.source === 'auto' && !isPublishableRentalPostSet(set)) {
+    const error = 'ยกเลิกคิว: ระบบอัตโนมัติโพสต์เฉพาะทรัพย์เช่าที่มี Ref/CD อนุมัติแล้วเท่านั้น'
+    const at = new Date().toISOString()
+    updateSchedule(scheduleId, { status: 'failed', finishedAt: at, results: [{ ok: false, error, at }] })
+    throw new Error(error)
+  }
+  const reliability = autopostReliability()
+  const runId = reliability.startRun({ scheduleId, accountId, postSetId: schedule.postSetId })
 
   // Always sanitize at send time so legacy saved sets cannot leak floor data.
   const text = preparePostText(set.text || '')
@@ -608,6 +921,7 @@ export async function runSchedule(scheduleId, { onStep = () => {} } = {}) {
       results: configuredGroups.map((group) => ({ group, ok: false, error, at })),
       finishedAt: at,
     })
+    reliability.finishRun(runId, 'FAILED')
     throw new Error(error)
   }
   // Random mode posts to exactly one group successfully.  It keeps the other
@@ -620,9 +934,12 @@ export async function runSchedule(scheduleId, { onStep = () => {} } = {}) {
     ? rotateGroupsForAccount(allowedGroups, accountId)
     : allowedGroups
 
+  const accountLease = tryAcquireAccount(accountId, 'POSTING')
+  if (!accountLease) throw new Error(`บัญชีนี้กำลังถูกใช้งาน (${accountBrowserState(accountId).state}) — รอจนเสร็จ`)
   runningAccountIds.add(accountId)
   updateSchedule(scheduleId, { status: 'posting', results: [], lastRunAt: new Date().toISOString() })
   const results = []
+  const submittedGroups = new Set()
   // This is deliberately advisory, not a hard stop: the operator may decide
   // to repost immediately. Normal scheduled batches still enforce their own
   // 30-minute minimum when they are created.
@@ -640,16 +957,47 @@ export async function runSchedule(scheduleId, { onStep = () => {} } = {}) {
   onStep(`เริ่มโพสต์ "${set.name}" → ${groups.length} กลุ่ม`)
 
   let { browser, context } = {}
+  let timedOut = false
+  const hardTimeout = setTimeout(() => {
+    timedOut = true
+    onStep(`⏱️ งานเกิน ${Math.round(POST_RUN_TIMEOUT_MS / 60_000)} นาที — ปิดเบราว์เซอร์ที่ค้างและคืนการควบคุมให้คิว`)
+    // Closing the context interrupts every outstanding Playwright wait/goto.
+    // browser.close is a fallback for a context wedged in Chromium itself.
+    Promise.resolve(context?.close()).catch(() => {})
+    Promise.resolve(browser?.close()).catch(() => {})
+  }, POST_RUN_TIMEOUT_MS)
+  hardTimeout.unref()
   try {
     ;({ browser, context } = await launchContext(sessionPath))
     for (let i = 0; i < groups.length; i++) {
       const group = groups[i]
+      const attemptId = reliability.startAttempt(runId, group)
       onStep(`(${i + 1}/${groups.length}) ${groupLabel(group)}`)
-      const res = await postToGroup(context, group, { text, imagePaths }, onStep)
+      const res = await postToGroup(context, group, { text, imagePaths }, onStep,
+        (stage, metadata) => {
+          reliability.event(runId, attemptId, stage, 'PASSED', null, metadata)
+          if (stage === 'SUBMIT_CLICKED') {
+            submittedGroups.add(group)
+            updateSchedule(scheduleId, {
+              results: [...results, {
+                group,
+                ok: false,
+                pending: true,
+                submitted: true,
+                verified: 'submitted',
+                safeToResubmit: false,
+                attemptId,
+                at: new Date().toISOString(),
+              }],
+            })
+          }
+        }, { attemptId, accountId })
+      const audited = reliability.finishAttempt(runId, attemptId, res)
       if (res.ok) saveGroupMembership(accountId, group, 'joined')
       else if (String(res.error || '').startsWith('กลุ่มกำลังรออนุมัติ')) saveGroupMembership(accountId, group, 'requested')
       else if (isNotMemberError(res.error)) saveGroupMembership(accountId, group, 'not_member')
-      results.push({ group, ok: res.ok, pending: res.pending === true, error: res.error, postUrl: res.postUrl, verified: res.verified, at: new Date().toISOString() })
+      const wasSubmitted = audited.submitted === true || submittedGroups.has(group)
+      results.push({ group, ok: audited.ok, pending: audited.pending === true || (wasSubmitted && !audited.ok), submitted: wasSubmitted, verificationExpired: audited.verificationExpired === true, verificationVersion: audited.verificationVersion || null, error: audited.error, errorCode: audited.errorCode, safeToResubmit: wasSubmitted ? false : audited.safeToResubmit, attemptId, postUrl: audited.postUrl, evidenceUrl: audited.evidenceUrl || null, publishReceipt: audited.publishReceipt || null, publishDiagnostics: audited.publishDiagnostics || [], verified: audited.verified || (wasSubmitted ? 'submitted' : null), at: new Date().toISOString() })
       updateSchedule(scheduleId, { results: [...results] })
 
       if (useSingleRandomGroup && res.ok) break
@@ -662,14 +1010,21 @@ export async function runSchedule(scheduleId, { onStep = () => {} } = {}) {
       }
     }
   } catch (e) {
-    onStep(`⚠️ โพสต์ล้มเหลว: ${e.message}`)
+    const failureMessage = timedOut
+      ? `งานโพสต์ค้างเกิน ${Math.round(POST_RUN_TIMEOUT_MS / 60_000)} นาที ระบบยกเลิกอัตโนมัติ: ${e.message}`
+      : e.message
+    onStep(`⚠️ โพสต์ล้มเหลว: ${failureMessage}`)
     // A browser-level failure (couldn't launch) marks remaining groups as errored.
     if (results.length < groups.length) {
       for (const g of groups.slice(results.length)) {
-        results.push({ group: g, ok: false, error: e.message, at: new Date().toISOString() })
+        const failure = classifyPostingError(failureMessage)
+        const attemptId = reliability.startAttempt(runId, g)
+        const audited = reliability.finishAttempt(runId, attemptId, { ok: false, error: failureMessage })
+        results.push({ group: g, ok: false, submitted: false, error: failureMessage, errorCode: failure.code, safeToResubmit: audited.safeToResubmit, attemptId, at: new Date().toISOString() })
       }
     }
   } finally {
+    clearTimeout(hardTimeout)
     const sessionExpired = results.some((result) => String(result.error || '').includes(SESSION_EXPIRED_MESSAGE))
     if (sessionExpired) {
       markAccountSessionExpired(accountId)
@@ -683,29 +1038,171 @@ export async function runSchedule(scheduleId, { onStep = () => {} } = {}) {
       })
     }
     runningAccountIds.delete(accountId)
+    accountLease.release()
     const finalStatus = scheduleStatusForResults(results)
+    reliability.finishRun(runId, finalStatus.toUpperCase())
     updateSchedule(scheduleId, {
       status: finalStatus,
       results,
       finishedAt: new Date().toISOString(),
     })
     if (browser) await browser.close().catch(() => {})
-    if (isOneTimePostComplete(schedule, results)) {
-      const stillReserved = listSchedules().some((item) =>
-        item.id !== scheduleId && item.postSetId === set.id && ['pending', 'posting'].includes(item.status))
-      if (stillReserved) {
-        onStep('📦 โพสต์สำเร็จแล้ว แต่ยังเก็บชุดไว้เพราะมีงานอื่นรอใช้')
-      } else {
-        try {
-          deleteSet(set.id)
-          removeAutoCampaignPostSets([set.id])
-          onStep('🗑️ โพสต์สำเร็จแล้ว · ลบชุดโพสต์ออกจากรายการอัตโนมัติ')
-        } catch (cleanupError) {
-          onStep(`⚠️ โพสต์สำเร็จ แต่ลบชุดโพสต์ไม่สำเร็จ: ${cleanupError.message}`)
-        }
-      }
-    }
   }
   onStep(`เสร็จสิ้น · สำเร็จ ${results.filter((r) => r.ok).length}/${results.length} กลุ่ม`)
   return results
+}
+
+async function findDelayedPermalink(page, groupUrl, text, submittedAt, evidence = {}) {
+  const markers = postVerificationMarkers(text)
+  const reference = markers.find((marker) => /\b[A-Z]{1,8}-\d{3,}\b/i.test(marker))
+  if (!reference) return null
+  const searchUrl = new URL(groupUrl)
+  searchUrl.pathname = `${searchUrl.pathname.replace(/\/?$/, '/')}search/`
+  searchUrl.search = ''
+  searchUrl.searchParams.set('q', reference)
+  await page.goto(searchUrl.toString(), { waitUntil: 'domcontentloaded', timeout: 60000 })
+  await page.waitForTimeout(2000)
+  // Facebook frequently collapses the property reference behind “See more”.
+  // Group search has already been scoped to this exact, unique reference, so
+  // inspect its result cards after expanding them instead of requiring the
+  // reference to exist in the initially-rendered (truncated) DOM.
+  const cards = page.locator('[role="article"]')
+  let foundRecentCard = false
+  let recentCardForEvidence = null
+  for (let index = 0; index < await cards.count(); index += 1) {
+    const card = cards.nth(index)
+    const more = card.getByText(/^(?:ดูเพิ่มเติม|See more)$/i).first()
+    if (await more.isVisible().catch(() => false)) await more.click().catch(() => {})
+    const [hrefs, unixTimes, cardText, timestampLabels] = await Promise.all([
+      card.locator('a[href]').evaluateAll((anchors) => anchors.map((anchor) => anchor.href)).catch(() => []),
+      card.locator('[data-utime]').evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-utime'))).catch(() => []),
+      card.innerText().catch(() => ''),
+      card.locator('a[href]').evaluateAll((anchors) => anchors.flatMap((anchor) => [
+        anchor.getAttribute('aria-label'), anchor.getAttribute('title'),
+        anchor.querySelector('[aria-label]')?.getAttribute('aria-label'),
+      ]).filter(Boolean)).catch(() => []),
+    ])
+    // The search URL itself is an exact query for the unique property code.
+    // Facebook may keep that code inside collapsed text even after the click
+    // (the visual result is still the matching post). Recency is therefore the
+    // second, independent guard against accepting an older search result.
+    if (!isPostCardRecent({ unixTimes, cardText: `${cardText}\n${timestampLabels.join('\n')}`, submittedAt })) continue
+    foundRecentCard = true
+    recentCardForEvidence ||= card
+    const permalink = facebookPostPermalink(hrefs, groupUrl, { allowPhotoFallback: true })
+    if (permalink && await permalinkContainsMarker(page, permalink, reference)) {
+      return { verified: 'permalink', postUrl: permalink, evidenceUrl: await captureFullPermalinkPost(page, permalink, reference, { ...evidence, reference, groupUrl, postUrl: permalink }) }
+    }
+  }
+  if (!foundRecentCard) return null
+  return { verified: 'group_card', postUrl: null, evidenceUrl: await capturePostEvidence(recentCardForEvidence, { ...evidence, reference, groupUrl }) }
+}
+
+// Facebook sometimes indexes a successful group post several minutes after
+// the composer closes. Re-check those submissions without clicking Post again.
+// One result per invocation keeps browser usage small and avoids contending
+// with an account that is currently publishing another room.
+export async function reverifyUnconfirmedSchedules({ maxResults = 3, onStep = () => {} } = {}) {
+  let checked = 0
+  for (const schedule of listSchedules()) {
+    if (checked >= maxResults) break
+    const accountId = schedule.accountId || 'primary'
+    if (schedule.status !== 'unconfirmed' || isPosting(accountId) || !accountSessionReady(accountId)) continue
+    // Publishing is the primary job. Do not let a delayed-permalink lookup
+    // acquire the account browser while a real post is waiting in its queue.
+    if (listSchedules().some((item) => (item.accountId || 'primary') === accountId
+      && item.status === 'pending' && new Date(item.runAt).getTime() <= Date.now() + 2 * 60_000)) continue
+    const set = schedule.postSetId ? getSet(schedule.postSetId) : null
+    if (!set) continue
+    const resultIndex = (schedule.results || []).findIndex((result) => {
+      const hasCapturedCreateReceipt = Boolean(result.evidenceUrl
+        && (result.publishDiagnostics || []).some((diagnostic) =>
+          diagnostic.expectedCreate === true && Number(diagnostic.status) >= 200 && Number(diagnostic.status) < 300))
+      return result.submitted === true && result.verified !== 'permalink' && !result.postUrl
+        // A previous immediate-verification timeout is not proof of failure.
+        // Retry it a bounded number of times without ever clicking Post again.
+        && (hasCapturedCreateReceipt || Number(result.verificationAttempts || 0) < 3)
+    })
+    if (resultIndex < 0) continue
+    checked += 1
+    const result = schedule.results[resultIndex]
+    const sessionPath = accountSessionPath(accountId)
+    const accountLease = tryAcquireAccount(accountId, 'POST_VERIFY')
+    if (!accountLease) continue
+    let browser
+    let context
+    runningAccountIds.add(accountId)
+    try {
+      ;({ browser, context } = await launchContext(sessionPath))
+      const page = await context.newPage()
+      const evidenceId = result.attemptId || `${schedule.id}_${resultIndex}`
+      const submittedAt = (result.publishDiagnostics || [])
+        .find((diagnostic) => diagnostic.expectedCreate === true)?.at
+        || result.at || schedule.finishedAt
+      // Some Facebook layouts visually render the exact search result but do
+      // not expose its expanded text to Playwright. A successful create
+      // mutation plus the captured result screen is still independent proof;
+      // promote it without ever submitting the room again.
+      const hasCapturedCreateReceipt = Boolean(result.evidenceUrl
+        && (result.publishDiagnostics || []).some((diagnostic) =>
+          diagnostic.expectedCreate === true && Number(diagnostic.status) >= 200 && Number(diagnostic.status) < 300))
+      const searchedEvidence = hasCapturedCreateReceipt
+        ? null
+        : await findDelayedPermalink(page, result.group, preparePostText(set.text || ''), submittedAt, { attemptId: evidenceId, accountId })
+      const evidence = searchedEvidence || (hasCapturedCreateReceipt ? {
+        verified: 'group_card',
+        postUrl: null,
+        evidenceUrl: result.evidenceUrl,
+      } : null)
+      const permalink = evidence?.postUrl || null
+      await page.close().catch(() => {})
+      const now = new Date().toISOString()
+      const submittedMs = new Date(result.at || schedule.finishedAt || 0).getTime()
+      const attemptCount = Number(result.verificationAttempts || 0) + 1
+      const verificationExpired = attemptCount >= 30 || (Number.isFinite(submittedMs) && Date.now() - submittedMs >= 6 * 60 * 60_000)
+      const results = schedule.results.map((item, index) => index === resultIndex ? {
+        ...item,
+        ...(evidence ? {
+          ok: true,
+          pending: false,
+          submitted: true,
+          verified: evidence.verified,
+          postUrl: permalink,
+          evidenceUrl: evidence.evidenceUrl || item.evidenceUrl || null,
+          error: null,
+          verifiedAt: now,
+          verificationVersion: 2,
+        } : {
+          verificationAttempts: attemptCount,
+          verificationVersion: 2,
+          lastVerificationAt: now,
+          verificationExpired,
+          error: verificationExpired
+            ? 'Facebook รับคำสั่งโพสต์แล้ว แต่ยังยืนยันหลักฐานไม่ได้ภายใน 6 ชั่วโมง — ต้องเปิดกลุ่มตรวจครั้งเดียว ห้ามระบบโพสต์ซ้ำ'
+            : item.error,
+        }),
+      } : item)
+      updateSchedule(schedule.id, {
+        status: scheduleStatusForResults(results),
+        results,
+        finishedAt: now,
+      })
+      autopostReliability().recordVerification(result.attemptId, {
+        postUrl: permalink,
+        verified: evidence?.verified,
+        error: evidence ? null : 'ยังไม่พบโพสต์ในการตรวจย้อนหลัง',
+      })
+      await context.storageState({ path: sessionPath }).catch(() => {})
+      if (evidence) {
+        onStep(`✅ ตรวจย้อนหลังพบโพสต์ของ "${schedule.name}"${permalink ? '' : ' (Facebook ซ่อน permalink)'}`)
+      }
+    } catch (error) {
+      onStep(`⚠️ ตรวจ permalink ย้อนหลังไม่สำเร็จ (${schedule.name}): ${error.message}`)
+    } finally {
+      if (browser) await browser.close().catch(() => {})
+      runningAccountIds.delete(accountId)
+      accountLease.release()
+    }
+  }
+  return checked
 }

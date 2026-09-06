@@ -13,9 +13,13 @@ export const SCHEDULER_POLICY = {
   inactiveBackoffMinutes: 360,
   maxBackoffMinutes: 1440,
   failurePauseThreshold: 4,
-  globalSourceBudget: 12,
-  perSourcePageBudget: 12,
-  concurrency: 3,
+  // Keep Facebook collection deliberately small on the local workstation.
+  // The scheduler will revisit high-value sources on later ticks instead of
+  // opening several browser-heavy crawls at once.
+  globalSourceBudget: 4,
+  manualRefreshSourceBudget: 2,
+  perSourcePageBudget: 6,
+  concurrency: 1,
   knownPostStopSteps: 3,
   backfillEnabled: false,
   backfillSourceBudget: 2,

@@ -2,31 +2,41 @@ import { pathToFileURL } from 'node:url'
 import { createPropertyDataService } from '../db/service.js'
 import { deterministicExtract } from '../pipeline/deterministicExtractor.js'
 
-const GENERIC_NAME = /^(?:คอนโด|condo|house|home|apartment|for\s+rent|pet[- ]?friendly\s+condo|ดู(?:เพิ่ม|น้อย)เติม)$/iu
+const GENERIC_NAME = /^(?:คอนโด|condo|house|home|apartment|for\s+rent|pet[- ]?friendly\s+condo|corner\s+unit|duplex|loft|penthouse|studio|ดู(?:เพิ่มเติม|น้อยลง))$/iu
 const PROJECT_SIGNAL = /\b(?:condo|apartment|residence|tower|place|park|parc|maestro|ideo|metris|life|origin|aspire|noble|scope|metropole|villa)\b|คอนโด|โครงการ|หมู่บ้าน|เรสซิเดนซ์/iu
 
 export function isSuspiciousStoredProject(value) {
   if (!value) return true
   const name = String(value).trim()
   return GENERIC_NAME.test(name)
-    || /#|ดู(?:เพิ่ม|น้อย)เติม|(?:ราคา|ค่าเช่า|rent)\s*[:：]?\s*\d|(?:ชั้น|floor)\s*\d|property\s+details/iu.test(name)
+    || /#|ดู(?:เพิ่มเติม|น้อยลง)|(?:ราคา|ค่าเช่า|rent)\s*[:：]?\s*\d|(?:ชั้น|floor)\s*\d|property\s+details/iu.test(name)
     || /^ดู(?:เพิ่มเติม|น้อยลง)$/u.test(name)
     || /^(?:on the|ready to|available|ขาย\s*\/\s*ให้เช่า)/iu.test(name)
+    || /(?:เสนอลูกค้า|ขอรายละเอียด|เครื่องปรับอากาศ|แอร์\s*\d|7-eleven|เซเว่น)/iu.test(name)
+    || /^(?:สถานที่ใกล้|สถานที่สำคัญ|สิ่งอำนวยความสะดวก|จุดเด่น)/u.test(name)
+    || /#\p{L}/u.test(name)
+    || isRepeatedProjectName(name)
     || name.length > 90
+}
+
+function isRepeatedProjectName(value) {
+  const words = String(value).trim().split(/\s+/)
+  if (words.length < 4 || words.length % 2 !== 0) return false
+  const middle = words.length / 2
+  return words.slice(0, middle).join(' ').toLocaleLowerCase() === words.slice(middle).join(' ').toLocaleLowerCase()
 }
 
 export function isSafeProjectBackfill(rawText, property) {
   const name = String(property?.project_name_raw || '').trim()
   if (!name || name.length < 3 || name.length > 80 || GENERIC_NAME.test(name)) return false
-  if (/ราคา|ค่าเช่า|\d[\d,.]*\s*(?:บาท|thb|sqm|ตร\.?\s*ม)|#|ดู(?:เพิ่ม|น้อย)เติม/iu.test(name)) return false
+  if (/ราคา|ค่าเช่า|\d[\d,.]*\s*(?:บาท|thb|sqm|ตร\.?\s*ม)|#|ดู(?:เพิ่มเติม|น้อยลง)/iu.test(name)) return false
   if (/^\(?owner|^agent|^new(?:ly)?|^spacious|^cat[- ]?friendly|^home\s+for|^house\s+for|^บ้านทาวน์โฮม|^บ้านเดี่ยว(?:หลัง|ใน)|^โฮมออฟฟิศ|^condo\s+details?$/iu.test(name)) return false
   if (/^(?:boutique\s+residence|detached\s+house\s+at)\b/iu.test(name)) return false
   const quote = property.evidence?.find((item) => item.field === 'project_name_raw')?.quote
   if (!quote || !String(rawText).includes(quote)) return false
   const start = String(rawText).indexOf(quote)
   const before = String(rawText).slice(Math.max(0, start - 100), start)
-  return start === 0
-    || PROJECT_SIGNAL.test(name)
+  return PROJECT_SIGNAL.test(name)
     || /(?:for\s+rent|ให้เช่า|ปล่อยเช่า)\s*[|:：–—\n-]*\s*$/iu.test(before)
     || /(?:for\s+rent|ให้เช่า|ปล่อยเช่า|โครงการ|หมู่บ้าน|pet[- ]?friendly)[^\n]{0,90}$/iu.test(before)
 }

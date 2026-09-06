@@ -6,7 +6,7 @@ export function createPropertiesRouter(service, processingQueue = null, repairJo
   const router = express.Router()
   router.get('/', (req, res) => {
     try {
-      res.json(service.query(req.query))
+      res.json(service.query({ ...req.query, ownerOnly: true, rentOnly: true }))
     } catch (error) {
       res.status(500).json({ error: errorMessage(error) })
     }

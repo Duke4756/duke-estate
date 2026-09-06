@@ -9,8 +9,10 @@ const fileToDataUrl = (file) =>
     r.readAsDataURL(file)
   })
 
-export default function PostSetEditor({ open, set, onClose, onSaved }) {
+export default function PostSetEditor({ open, set, onClose, onSaved, kind, propertyType: initialPropertyType, deal: initialDeal }) {
   const [name, setName] = useState('')
+  const [propertyType, setPropertyType] = useState('condo')
+  const [deal, setDeal] = useState('rent')
   const [text, setText] = useState('')
   // A single list is important: it lets new and existing images be rearranged together.
   const [images, setImages] = useState([]) // [{id, type: 'existing'|'new', file?, url}]
@@ -25,6 +27,8 @@ export default function PostSetEditor({ open, set, onClose, onSaved }) {
   useEffect(() => {
     if (!open) return
     setName(set?.name || '')
+    setPropertyType(set?.kind || initialPropertyType || 'condo')
+    setDeal(set?.deal || initialDeal || 'rent')
     setText(set?.text || '')
     setImages((set?.images || []).map((image) => ({
       id: `existing-${image.file}`,
@@ -35,7 +39,7 @@ export default function PostSetEditor({ open, set, onClose, onSaved }) {
     setDraggingImages(false)
     setSourceUrl(set?.sourceUrl || '')
     getJsaSession().then(setJsaSession).catch(() => {})
-  }, [open, set])
+  }, [open, set, initialPropertyType, initialDeal])
 
   if (!open) return null
 
@@ -77,9 +81,12 @@ export default function PostSetEditor({ open, set, onClose, onSaved }) {
     setSaving(true)
     setError(null)
     try {
+      let saved
       if (set?.id) {
-        await updatePostSet(set.id, {
+        saved = await updatePostSet(set.id, {
           name,
+          propertyType,
+          deal,
           text,
           keepImages: images.filter((image) => image.type === 'existing').map((image) => image.file),
           newImages: images
@@ -92,9 +99,9 @@ export default function PostSetEditor({ open, set, onClose, onSaved }) {
           ),
         })
       } else {
-        await createPostSet({ name, text, images: images.map((image) => image.url), sourceUrl })
+        saved = await createPostSet({ name, text, images: images.map((image) => image.url), sourceUrl, kind, propertyType, deal })
       }
-      onSaved()
+      onSaved(saved)
     } catch (e) {
       setError(e.message)
     } finally {
@@ -152,7 +159,7 @@ export default function PostSetEditor({ open, set, onClose, onSaved }) {
       >
         <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
           <h2 className="text-base font-bold text-slate-800">
-            {set?.id ? '✏️ แก้ไขชุดโพสต์' : '📝 สร้างชุดโพสต์'}
+            {set?.id ? '✏️ แก้ไขทรัพย์' : '📝 เพิ่มทรัพย์'}
           </h2>
           <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-xl leading-none">
             ✕
@@ -187,6 +194,15 @@ export default function PostSetEditor({ open, set, onClose, onSaved }) {
             placeholder="ชื่อชุดโพสต์ (สำหรับอ้างอิง) เช่น โปรโมชั่นเดือนนี้"
             className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-indigo-400"
           />
+
+          <div className="grid grid-cols-2 gap-2">
+            <label className="text-xs font-semibold text-slate-500">หมวดทรัพย์
+              <select value={propertyType} onChange={(e) => setPropertyType(e.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"><option value="condo">คอนโด</option><option value="house">บ้าน</option></select>
+            </label>
+            <label className="text-xs font-semibold text-slate-500">ประเภทประกาศ
+              <select value={deal} onChange={(e) => setDeal(e.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"><option value="rent">เช่า</option><option value="sale">ขาย</option></select>
+            </label>
+          </div>
 
           <textarea
             value={text}

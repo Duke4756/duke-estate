@@ -23,5 +23,10 @@ describe('canonical transit station directory', () => {
       distanceValue: 200, distanceUnit: 'm', originalMention: expect.stringContaining('BTS อ่อนนุช'),
     })
     expect(result.posts[0].transitStations[0].evidenceText).toContain('BTS อ่อนนุช')
+    expect(service.query({ search: 'BTS อ่อนนุช' }).total).toBe(1)
+    expect(service.query({ search: 'อ่อนนุช' }).total).toBe(1)
+    expect(service.query({ search: 'Onnut' }).total).toBe(1)
+    expect(service.query({ transit: 'อ่อน' }).total).toBe(1)
+    expect(service.query({ transit: 'BTS อ่อนนุช' }).total).toBe(1)
   })
 })

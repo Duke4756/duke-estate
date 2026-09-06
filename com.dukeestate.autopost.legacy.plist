@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.dukeestate.autopost</string>
+<key>ProgramArguments</key><array><string>/usr/bin/caffeinate</string><string>-dimsu</string><string>/usr/local/bin/node</string><string>/Users/admin/Documents/Duke Estate/Duke-Estate/server/autopostSupervisor.js</string></array>
+<key>WorkingDirectory</key><string>/Users/admin/Documents/Duke Estate/Duke-Estate</string>
+<key>EnvironmentVariables</key><dict><key>APP_ROLE</key><string>autopost</string><key>PORT</key><string>8787</string><key>PATH</key><string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer><key>ProcessType</key><string>Background</string>
+<key>StandardOutPath</key><string>/Users/admin/Documents/Duke Estate/Duke-Estate/server/autopost/launchd.log</string>
+<key>StandardErrorPath</key><string>/Users/admin/Documents/Duke Estate/Duke-Estate/server/autopost/launchd-error.log</string>
+</dict></plist>

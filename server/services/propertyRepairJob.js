@@ -69,7 +69,10 @@ function applyRepair(service, row, extracted, now) {
   if (!hasStation && matches.length) { saveTransitMatches(service.db, row.id, row.raw_post_id, matches, now); station = 1 }
   return { fields: Object.keys(patch).length, project: !row.project_verified && Boolean(patch.project_id) ? 1 : 0, station }
 }
-function canFill(row, field) { if (['project_match_method','project_match_score','project_id','project_name_canonical'].includes(field)) return !row.project_verified; return row[field] == null || row[field] === '' || row[field] === 'unknown' }
+function canFill(row, field) {
+  if (['project_name_raw','project_match_method','project_match_score','project_id','project_name_canonical'].includes(field)) return !row.project_verified
+  return row[field] == null || row[field] === '' || row[field] === 'unknown'
+}
 function addEvidence(db, propertyId, rawText, extracted, fields) {
   const insert = db.prepare(`INSERT INTO field_evidence(property_id,field_name,value_json,quote,confidence,validation_status) SELECT ?,?,?,?,?, 'valid' WHERE NOT EXISTS (SELECT 1 FROM field_evidence WHERE property_id=? AND field_name=? AND quote=?)`)
   for (const field of fields) {

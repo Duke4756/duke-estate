@@ -1,18 +1,23 @@
 import fs from 'node:fs'
+import path from 'node:path'
+import { spawn } from 'node:child_process'
 import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
 import { mockPosts } from '../src/data/mockPosts.js'
 import { scrapeGroups, hasSession } from './scraper.js'
 import { duplicateGroups, groupKey, loadGroups, loadGroupsFull, loadGroupsByCategory, saveGroups, groupLabel } from './groups.js'
+import { resolveFacebookGroupNames } from './groupNameResolver.js'
 import { loadKeywords, saveKeywords, getDefaults as getDefaultKeywords, loadExtras } from './keywords.js'
 import { saveRound, listRounds, getRound, deleteRound, roundFilePath } from './history.js'
 import { saveOwnerPosts, queryOwnerPosts, deleteOwnerPost } from './ownerPosts.js'
-import { listSets, createSet, updateSet, refreshImportedSet, deleteSet, deleteSets, reorderSets, findSetBySourceUrl, IMAGES_DIR } from './postsets.js'
+import { listSets, createSet, updateSet, refreshImportedSet, deleteSet, deleteSets, reorderSets, findSetBySourceUrl, isPublishableRentalPostSet, IMAGES_DIR } from './postsets.js'
+import { previewMarketingPlan, parseMarketingPlan, buildPlanPlacements, resolveProjectId } from './aiMarketingPlan.js'
 import { importPropertyUrl } from './propertyImporter.js'
-import { disconnectJsaSession, finishJsaLogin, importJsaProperty, jsaSessionStatus, startJsaLogin } from './jsaSession.js'
+import { disconnectJsaSession, finishJsaLogin, importJsaProperty, resolveJsaPropertyUrlByCd, jsaSessionStatus, refreshJsaSession, startJsaLogin } from './jsaSession.js'
 import { listSchedules, createSchedule, createScheduleBatch, updateSchedule, deleteSchedule, clearAutoCampaignSchedules, recoverInterruptedSchedules, reclassifyUnverifiedAcceptedSchedules, remainingAccountPostGap, displayScheduleStatus, isVerifiedPostResult } from './schedules.js'
-import { canPost, runSchedule, isPosting } from './poster.js'
+import { canPost, POST_EVIDENCE_DIR, reverifyUnconfirmedSchedules, runSchedule, isPosting } from './poster.js'
+import { groupMembershipFor } from './groupMembershipStore.js'
 import { createPropertyDataService } from './db/service.js'
 import { createPropertiesRouter } from './routes/properties.js'
 import { facebookLeadToRawPost, facebookPostIdentity } from './adapters/facebookGroupAdapter.js'
@@ -31,10 +36,12 @@ import {
   finishGroupMembership,
   cancelGroupMembership,
   removeAccount,
+  interactiveAccountBrowserOpen,
 } from './accounts.js'
 import { getPostingSettings, savePostingSettings, isWithinPostingWindow, nextPostingWindowStart } from './postingSettings.js'
 import { selectConcurrentDueSchedules } from './concurrentScheduler.js'
-import { getAutoCampaign, includeAutoCampaignPostSet, materializeAutoCampaign, removeAutoCampaignPostSets, saveAutoCampaign, takeNextDiversePostSet } from './autoCampaigns.js'
+import { nextAccountOccurrence } from './accountPostPlan.js'
+import { accountPostingRule, getAutoCampaign, includeAutoCampaignPostSet, materializeAutoCampaign, removeAutoCampaignPostSets, saveAutoCampaign, takeNextDiversePostSet } from './autoCampaigns.js'
 import { classifyOwnerListingPosts } from './pipeline/ownerListingClassifier.js'
 import { createOwnerListingExtractionService } from './services/ownerListingExtractionService.js'
 import { createOwnerListingRepository } from './db/repositories/ownerListings.js'
@@ -47,6 +54,9 @@ import { createAdaptiveScheduler } from './services/adaptiveScheduler.js'
 import { createCoverageEstimator } from './services/coverageEstimator.js'
 import { createSourcesRouter } from './routes/sources.js'
 import { refreshListingFreshness } from './db/repositories/listingClusters.js'
+import { pruneExtractionCache } from './db/repositories/cache.js'
+import { PIPELINE_VERSION } from './pipeline/versions.js'
+import { autopostReliability } from './autopostReliability.js'
 
 dotenv.config()
 
@@ -55,13 +65,57 @@ const AUTOPOST_ENABLED = APP_ROLE !== 'search'
 const PROCESSING_ENABLED = APP_ROLE !== 'autopost'
 
 const app = express()
+// The legacy Facebook search/raw-post pipeline has been retired. Keep old
+// clients from starting a scrape while the property stock and autopost APIs
+// remain available.
+app.use('/api/leads', (_req, res) => res.status(410).json({ error: 'ระบบค้นหาและโพสต์ดิบถูกปิดใช้งานแล้ว' }))
+let eventLoopLagMs = 0
+let eventLoopExpectedAt = Date.now() + 1000
+const eventLoopProbe = setInterval(() => {
+  const now = Date.now()
+  eventLoopLagMs = Math.max(0, now - eventLoopExpectedAt)
+  eventLoopExpectedAt = now + 1000
+}, 1000)
+eventLoopProbe.unref()
 app.use(cors())
 app.use(express.json({ limit: '50mb' })) // large limit — post-set images arrive as base64
 app.use('/api/postsets/images', express.static(IMAGES_DIR))
+// Keep the action route before the static evidence handler. With
+// `fallthrough: false`, express.static answers POST requests with 405 and the
+// Finder action below would otherwise never run.
+app.post('/api/autopost/evidence/open-folder', (_req, res) => {
+  try {
+    fs.mkdirSync(POST_EVIDENCE_DIR, { recursive: true })
+    if (process.platform !== 'darwin') return res.status(400).json({ error: 'ปุ่มเปิด Finder รองรับ macOS เท่านั้น' })
+    const child = spawn('open', [POST_EVIDENCE_DIR], { detached: true, stdio: 'ignore' })
+    // A GUI launch can be rejected by macOS (for example when the process has
+    // no active desktop session). Always consume the asynchronous spawn error;
+    // otherwise one click can terminate the whole scheduler process.
+    child.once('error', (error) => {
+      console.error(`[evidence] เปิด Finder ไม่สำเร็จ: ${error.message}`)
+    })
+    child.unref()
+    res.json({ ok: true, path: POST_EVIDENCE_DIR })
+  } catch (error) {
+    res.status(500).json({ error: `เปิดโฟลเดอร์ไม่สำเร็จ: ${error.message}` })
+  }
+})
+app.use('/api/autopost/evidence', express.static(POST_EVIDENCE_DIR, { fallthrough: false, maxAge: '7d' }))
+app.get('/api/autopost/reliability', (req, res) => {
+  try {
+    res.json(autopostReliability().summary({ hours: req.query.hours }))
+  } catch (error) {
+    res.status(500).json({ error: error.message })
+  }
+})
 const propertyData = createPropertyDataService()
+const cachePruneResult = pruneExtractionCache(propertyData.db, { pipelineVersion: PIPELINE_VERSION, maxEntries: 3000 })
+if (cachePruneResult.obsolete || cachePruneResult.lru) console.log(`  🧹 ลด extraction cache ${cachePruneResult.obsolete + cachePruneResult.lru} รายการ · คงไว้ ${cachePruneResult.remaining}`)
 const processingQueue = new PostProcessingQueue({
   db: propertyData.db,
   processor: (rawPost) => propertyData.ingest(rawPost, { useAI: Boolean(process.env.GEMINI_API_KEY) }),
+  ownerOnly: true,
+  rentOnly: true,
 })
 const propertyRepairJob = new PropertyRepairJob({ service: propertyData })
 const sourceRegistry = createSourceRegistry(propertyData.db)
@@ -128,7 +182,13 @@ app.get('/api/raw-posts/:id', (req, res) => {
 
 app.get('/api/accounts', async (req, res) => {
   try {
-    res.json({ accounts: await listAccountsVerified({ force: req.query.refresh === '1' }) })
+    // The dashboard polls this endpoint. Launching three Facebook browsers on
+    // every expired verification-cache read can make the entire API appear
+    // offline for minutes. Normal reads use the persisted scheduler status;
+    // an explicit refresh still performs the live Facebook verification.
+    res.json({ accounts: req.query.refresh === '1'
+      ? await listAccountsVerified({ force: true })
+      : listAccounts() })
   } catch (error) {
     res.status(500).json({ error: error.message })
   }
@@ -138,10 +198,12 @@ app.put('/api/accounts/:id', (req, res) => {
   catch (e) { res.status(400).json({ error: e.message }) }
 })
 app.post('/api/accounts/login/start', async (req, res) => {
+  if (isPosting() || sessionKeepaliveRunning || postReverifyRunning || jsaSessionKeepaliveRunning) return res.status(409).json({ error: 'Chrome กำลังทำงานเบื้องหลัง กรุณารอสักครู่แล้วลองใหม่ เพื่อป้องกันเครื่องกระตุก' })
   try { res.json({ account: await startAccountLogin(req.body?.name) }) }
   catch (e) { res.status(500).json({ error: e.message }) }
 })
 app.post('/api/accounts/:id/login/start', async (req, res) => {
+  if (isPosting() || sessionKeepaliveRunning || postReverifyRunning || jsaSessionKeepaliveRunning) return res.status(409).json({ error: 'Chrome กำลังทำงานเบื้องหลัง กรุณารอสักครู่แล้วลองใหม่ เพื่อป้องกันเครื่องกระตุก' })
   try { res.json({ account: await startAccountLogin(req.body?.name, req.params.id) }) }
   catch (e) { res.status(400).json({ error: e.message }) }
 })
@@ -203,9 +265,13 @@ app.get('/api/auto-campaign', (_req, res) => {
 })
 app.get('/api/auto-campaign/status', (_req, res) => {
   const statusNow = Date.now()
+  const bangkokDay = (value = new Date()) => new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date(value))
+  const today = bangkokDay()
   const campaign = getAutoCampaign()
   const accounts = new Map(listAccounts().map((account) => [account.id, account.name]))
-  const sets = listSets()
+  const sets = listSets().filter(isPublishableRentalPostSet)
   const runs = listSchedules()
     .filter((schedule) => schedule.source === 'auto')
     .slice(0, 20)
@@ -223,18 +289,21 @@ app.get('/api/auto-campaign/status', (_req, res) => {
       createdAt: schedule.createdAt,
       finishedAt: schedule.finishedAt || null,
       successCount: (schedule.results || []).filter(isVerifiedPostResult).length,
-      unconfirmedCount: showUnconfirmed ? (schedule.results || []).filter((result) => result.pending || ['accepted', 'unconfirmed'].includes(result.verified)).length : 0,
-      skippedCount: displayStatus === 'skipped' ? (schedule.results || []).filter((result) => result.pending || ['accepted', 'unconfirmed'].includes(result.verified)).length : 0,
+      unconfirmedCount: showUnconfirmed ? (schedule.results || []).filter((result) => Number(result.verificationVersion || 0) >= 4 && (result.pending || ['accepted', 'unconfirmed'].includes(result.verified))).length : 0,
+      skippedCount: displayStatus === 'skipped' ? (schedule.results || []).filter((result) => Number(result.verificationVersion || 0) >= 4 && (result.pending || ['accepted', 'unconfirmed'].includes(result.verified))).length : 0,
       attemptCount: (schedule.results || []).length,
       lastError: [...(schedule.results || [])].reverse().find((result) => !result.ok)?.error || null,
       successfulResults: (schedule.results || []).filter(isVerifiedPostResult).map((result) => ({
         group: result.group,
         postUrl: result.postUrl || null,
+        evidenceUrl: result.evidenceUrl || null,
+        publishReceipt: result.publishReceipt || null,
         verified: result.verified,
         at: result.at || schedule.finishedAt || null,
       })),
-      unconfirmedResults: showUnconfirmed ? (schedule.results || []).filter((result) => result.pending || ['accepted', 'unconfirmed'].includes(result.verified)).map((result) => ({
+      unconfirmedResults: showUnconfirmed ? (schedule.results || []).filter((result) => Number(result.verificationVersion || 0) >= 4 && (result.pending || ['accepted', 'unconfirmed'].includes(result.verified))).map((result) => ({
         group: result.group,
+        evidenceUrl: result.evidenceUrl || null,
         at: result.at || schedule.finishedAt || null,
         error: result.error || 'ยังไม่พบ permalink ยืนยัน',
       })) : [],
@@ -242,9 +311,14 @@ app.get('/api/auto-campaign/status', (_req, res) => {
       // window becomes "skipped". They were previously hidden from the UI at
       // exactly the point where an operator still needed to inspect the group.
       reviewResults: (schedule.results || []).filter((result) =>
-        result.pending || ['accepted', 'unconfirmed', 'submitted'].includes(result.verified)).map((result) => ({
+        Number(result.verificationVersion || 0) >= 4 && (result.pending || ['accepted', 'unconfirmed', 'submitted'].includes(result.verified))).map((result) => ({
         group: result.group,
+        evidenceUrl: result.evidenceUrl || null,
         verified: result.verified,
+        submitted: result.submitted === true,
+        verificationExpired: result.verificationExpired === true,
+        verificationAttempts: Number(result.verificationAttempts || 0),
+        lastVerificationAt: result.lastVerificationAt || null,
         at: result.at || schedule.finishedAt || null,
         error: result.error || 'ยังไม่พบ permalink ยืนยัน',
       })),
@@ -255,23 +329,85 @@ app.get('/api/auto-campaign/status', (_req, res) => {
       })),
     })})
   const previewSettings = structuredClone(campaign)
-  const previewReservedIds = []
+  const previewReservedIds = [...new Set(listSchedules()
+    .filter((schedule) => ['pending', 'posting', 'unconfirmed'].includes(schedule.status))
+    .map((schedule) => schedule.postSetId)
+    .filter(Boolean))]
+  const availableInventory = sets.filter((set) => !previewReservedIds.includes(set.id))
+  const inventory = {
+    total: sets.length,
+    available: availableInventory.length,
+    empty: campaign.mode === 'account_schedule' ? sets.length === 0 : availableInventory.length === 0,
+    blockedReason: availableInventory.length === 0 ? 'inventory_empty' : null,
+  }
   const plans = campaign.accountIds.map((accountId) => {
+    if (campaign.mode === 'account_schedule') {
+      const rule = campaign.accountRules[accountId]
+      const active = listSchedules().find((run) => run.accountId === accountId && run.source === 'auto' && ['pending', 'posting'].includes(run.status))
+      const next = nextAccountOccurrence(rule, campaign.accountState?.[accountId]?.lastOccurrence, statusNow)
+      const nextSet = sets.find((set) => set.id === (active?.postSetId || rule?.slots?.[0]?.postSetId))
+      return { accountId, accountName: accounts.get(accountId) || 'บัญชีหลัก', nextRunAt: active?.runAt || (next === null ? null : new Date(next).toISOString()),
+        nextPostSetId: nextSet?.id, nextPostSetName: next === null && !active ? 'ครบตามการตั้งค่าแล้ว' : nextSet?.name,
+        state: next === null && !active ? 'completed' : nextSet ? 'ready' : 'inventory_empty', randomPostSet: false }
+    }
     const nextSet = takeNextDiversePostSet({ settings: previewSettings, sets, reservedIds: previewReservedIds })
     if (nextSet) previewReservedIds.push(nextSet.id)
     return {
       accountId,
       accountName: accounts.get(accountId) || 'บัญชีหลัก',
-      nextRunAt: campaign.accountState?.[accountId]?.nextRunAt || null,
+      nextRunAt: nextSet ? (campaign.accountState?.[accountId]?.nextRunAt || null) : null,
       nextPostSetId: nextSet?.id || null,
       nextPostSetName: nextSet?.name || null,
+      state: nextSet ? 'ready' : (sets.length === 0 ? 'inventory_empty' : 'waiting_inventory'),
       randomPostSet: false,
     }
   })
-  res.json({ campaign, runs, plans, serverTime: new Date().toISOString() })
+  const historyByDay = new Map()
+  for (const schedule of listSchedules()) {
+    const accountId = schedule.accountId || 'primary'
+    for (const result of schedule.results || []) {
+      if (!isVerifiedPostResult(result)) continue
+      const postedAt = result.verifiedAt || result.at || schedule.finishedAt
+      if (!postedAt) continue
+      const day = bangkokDay(postedAt)
+      const dayAccounts = historyByDay.get(day) || new Map()
+      const current = dayAccounts.get(accountId) || { verified: 0, withEvidence: 0 }
+      current.verified += 1
+      if (result.evidenceUrl) current.withEvidence += 1
+      dayAccounts.set(accountId, current)
+      historyByDay.set(day, dayAccounts)
+    }
+  }
+  const statsForDay = (date) => {
+    const dayAccounts = historyByDay.get(date) || new Map()
+    const accountStats = [...accounts].map(([accountId, accountName]) => ({
+      accountId, accountName,
+      verified: dayAccounts.get(accountId)?.verified || 0,
+      withEvidence: dayAccounts.get(accountId)?.withEvidence || 0,
+    }))
+    return {
+      date,
+      total: accountStats.reduce((sum, item) => sum + item.verified, 0),
+      withEvidence: accountStats.reduce((sum, item) => sum + item.withEvidence, 0),
+      accounts: accountStats,
+    }
+  }
+  const dailyHistory = Array.from({ length: 30 }, (_, index) =>
+    statsForDay(bangkokDay(new Date(Date.now() - index * 86_400_000))))
+  const todayStats = statsForDay(today)
+  const dailyStats = {
+    ...todayStats,
+    history: dailyHistory,
+  }
+  res.json({ campaign, runs, plans, inventory, dailyStats, serverTime: new Date().toISOString() })
 })
 app.put('/api/auto-campaign', (req, res) => {
   try {
+    if (req.body?.pauseOnly === true) {
+      const campaign = saveAutoCampaign({ ...getAutoCampaign(), enabled: false })
+      scheduleNextDueCheck()
+      return res.json({ campaign })
+    }
     const requestedAccounts = [...new Set((req.body?.accountIds || []).filter(Boolean))]
     const knownAccounts = new Set(listAccounts().map((account) => account.id))
     if (requestedAccounts.some((id) => !knownAccounts.has(id))) {
@@ -283,12 +419,31 @@ app.put('/api/auto-campaign', (req, res) => {
     }
     const { bad } = validGroups(req.body?.groups)
     if (bad.length) return res.status(400).json({ error: 'ลิงก์กลุ่มไม่ถูกต้อง:\n' + bad.join('\n') })
+    const previousCampaign = getAutoCampaign()
+    if (req.body?.mode === 'account_schedule') {
+      const publishableSets = new Set(listSets().filter(isPublishableRentalPostSet).map((set) => set.id))
+      const activeGroups = new Set(loadGroups().filter((group) => group.active !== false).map((group) => group.url))
+      for (const accountId of requestedAccounts) {
+        const rule = req.body.accountRules?.[accountId] || {}
+        if (!Array.isArray(rule.slots) || rule.slots.some((slot) => !publishableSets.has(slot.postSetId))) throw new Error('เลือกทรัพย์เช่าที่พร้อมโพสต์ในสต็อกของแต่ละบัญชี')
+        if (rule.slots.some((slot) => validGroups([slot.group]).bad.length || !activeGroups.has(slot.group))) throw new Error('เลือกกลุ่มที่เปิดใช้งานในแต่ละบัญชี')
+        const firstTime = rule.time || rule.slots?.[0]?.time || '09:00'
+        if (!rule.repeatDaily && JSON.stringify(rule) !== JSON.stringify(previousCampaign.accountRules?.[accountId]) && Date.parse(`${rule.startDate}T${firstTime}:00+07:00`) < Date.now()) throw new Error('เวลาโพสต์ครั้งเดียวต้องเป็นเวลาในอนาคต')
+      }
+    }
     let clearedRuns = 0
     const campaign = saveAutoCampaign({
       ...req.body,
       enabled: req.body?.restartNow === true ? true : req.body?.enabled,
     })
-    if (req.body?.restartNow === true) clearedRuns = clearAutoCampaignSchedules()
+    if (campaign.mode === 'account_schedule') {
+      for (const run of listSchedules()) {
+        if (run.source !== 'auto' || run.status !== 'pending') continue
+        const changed = previousCampaign.mode !== campaign.mode || !campaign.accountIds.includes(run.accountId)
+          || JSON.stringify(previousCampaign.accountRules?.[run.accountId]) !== JSON.stringify(campaign.accountRules?.[run.accountId])
+        if (changed) { updateSchedule(run.id, { status: 'canceled' }); clearedRuns += 1 }
+      }
+    } else if (req.body?.restartNow === true) clearedRuns = clearAutoCampaignSchedules()
     let createdRuns = 0
     if (req.body?.restartNow === true) {
       // Create the new two-post burst before the regular scheduler checks its
@@ -436,11 +591,12 @@ async function fetchPosts(minutes, { fresh = false, onProgress = () => {}, onPos
 }
 
 let sourceJobDrain = null
-function runSourceJobs({ manual = false } = {}) {
+function runSourceJobs({ manual = false, maxJobs = Number.POSITIVE_INFINITY } = {}) {
   if (sourceJobDrain) return sourceJobDrain
   sourceJobDrain = (async () => {
     let job
-    while ((job = adaptiveScheduler.claim(`server-${process.pid}`))) {
+    let processedJobs = 0
+    while (processedJobs < maxJobs && (job = adaptiveScheduler.claim(`server-${process.pid}`))) {
       const source = sourceRegistry.get(job.source_group_id)
       const state = propertyData.db.prepare('SELECT * FROM source_autopilot_state WHERE id=1').get() || {}
       const enabled = manual || (job.lane === 'BACKFILL' ? state.backfill_enabled : state.autopilot_enabled)
@@ -448,6 +604,7 @@ function runSourceJobs({ manual = false } = {}) {
         propertyData.db.prepare("UPDATE source_crawl_jobs SET status='CANCELLED',completed_at=?,locked_at=NULL,locked_by=NULL,updated_at=? WHERE id=?").run(new Date().toISOString(), new Date().toISOString(), job.id)
         continue
       }
+      processedJobs += 1
       const counters = { posts_seen: 0, raw_posts_created: 0, duplicate_raw_posts: 0 }
       try {
         const result = await fetchPosts(job.lane === 'BACKFILL' ? 7 * 24 * 60 : 24 * 60, {
@@ -476,6 +633,10 @@ function runSourceJobs({ manual = false } = {}) {
 }
 
 const sourceSchedulerTimer = setInterval(() => {
+  // The Auto Post process must never launch Facebook collection browsers.
+  // Search/ingestion and publishing use separate application roles so three
+  // posting accounts retain their own CPU, memory and browser capacity.
+  if (!PROCESSING_ENABLED) return
   const state = propertyData.db.prepare('SELECT * FROM source_autopilot_state WHERE id=1').get() || {}
   if (state.autopilot_enabled) adaptiveScheduler.plan({ lane: 'FRESHNESS' })
   if (state.backfill_enabled) adaptiveScheduler.plan({ lane: 'BACKFILL' })
@@ -910,22 +1071,59 @@ function mergeSearchSnapshot(snapshot, leads, complete) {
   }
 }
 
-app.get('/api/health', async (req, res) => {
-  const verifiedAccounts = await listAccountsVerified()
+// This endpoint is polled by the watchdog every 15 seconds. It must never do
+// network or browser work: an earlier version verified every Facebook account
+// here, so slow Facebook pages caused overlapping Chrome launches, starved the
+// scheduler, and eventually made the watchdog kill an otherwise-live backend.
+app.get('/api/health', (_req, res) => {
+  const accounts = listAccounts()
   res.json({
     ok: true,
     gemini: Boolean(GEMINI_KEY),
     model: GEMINI_MODEL,
     hasSession: hasSession(),
-    canPost: verifiedAccounts.some((account) => account.ready),
+    canPost: accounts.some((account) => account.ready),
     postGapMinutes: Math.ceil(remainingAccountPostGap('primary') / 60_000),
-    postGapMinutesByAccount: Object.fromEntries(verifiedAccounts.map((account) => [
+    postGapMinutesByAccount: Object.fromEntries(accounts.map((account) => [
       account.id,
       Math.ceil(remainingAccountPostGap(account.id) / 60_000),
     ])),
     scraper: hasSession() ? 'local (session ready)' : 'demo (no session)',
     groups: loadGroups().map(groupLabel),
   })
+})
+
+let systemOverviewCache = { at: 0, value: null }
+app.get('/api/system-overview', (_req, res) => {
+  const now = Date.now()
+  if (systemOverviewCache.value && now - systemOverviewCache.at < 10_000) return res.json(systemOverviewCache.value)
+  const schedules = listSchedules()
+  const sets = listSets()
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0)
+  const todaySchedules = schedules.filter((item) => Date.parse(item.finishedAt || item.runAt || item.createdAt || 0) >= todayStart.getTime())
+  const memory = process.memoryUsage()
+  const value = {
+    sampledAt: new Date(now).toISOString(),
+    performance: { eventLoopLagMs, heapMb: Math.round(memory.heapUsed / 1048576), rssMb: Math.round(memory.rss / 1048576), uptimeHours: Math.round(process.uptime() / 36) / 100 },
+    database: {
+      properties: propertyData.db.prepare('SELECT COUNT(*) count FROM properties').get().count,
+      rawPosts: propertyData.db.prepare('SELECT COUNT(*) count FROM raw_posts').get().count,
+      postSets: sets.length,
+      companySets: sets.length,
+      ownerSets: 0,
+    },
+    posting: {
+      period: 'today', resetAt: '00:00 Asia/Bangkok',
+      pending: todaySchedules.filter((item) => item.status === 'pending').length,
+      posting: todaySchedules.filter((item) => item.status === 'posting').length,
+      failed: todaySchedules.filter((item) => item.status === 'failed').length,
+      completed: todaySchedules.filter((item) => item.status === 'done').length,
+      evidence: todaySchedules.reduce((count, item) => count + (item.results || []).filter((result) => result.evidenceUrl).length, 0),
+    },
+  }
+  value.health = value.performance.eventLoopLagMs > 500 || value.performance.heapMb > 900 ? 'critical' : value.performance.eventLoopLagMs > 150 || value.performance.heapMb > 600 ? 'warning' : 'healthy'
+  systemOverviewCache = { at: now, value }
+  res.json(value)
 })
 
 // List the monitored groups.
@@ -947,6 +1145,23 @@ app.get('/api/groups', (req, res) => {
   })
 })
 
+app.post('/api/groups/resolve-names', async (req, res) => {
+  const urls = Array.isArray(req.body?.urls) ? req.body.urls : loadGroupsFull().map((group) => group.url)
+  try {
+    const resolved = await resolveFacebookGroupNames(urls)
+    const byUrl = new Map(resolved.filter((item) => item.ok).map((item) => [item.url, item]))
+    const current = loadGroupsFull()
+    const saved = saveGroups(current.map((group) => ({
+      ...group,
+      name: byUrl.get(group.url)?.name || group.name || '',
+      memberCount: byUrl.get(group.url)?.memberCount || group.memberCount || null,
+    })))
+    res.json({ groups: saved.map((group) => ({ ...group, label: group.name || groupLabel(group.url) })), resolved })
+  } catch (error) {
+    res.status(500).json({ error: `เปิด Facebook เพื่อตรวจชื่อกลุ่มไม่สำเร็จ: ${error.message}` })
+  }
+})
+
 // Replace the monitored-group list. Body: { groups: [{url, active}] } (URL
 // strings are also accepted for backward compatibility).
 app.put('/api/groups', (req, res) => {
@@ -958,6 +1173,11 @@ app.put('/api/groups', (req, res) => {
       active: typeof g === 'object' ? g.active !== false : true,
       category: typeof g === 'object' ? String(g.category || 'general').trim() : 'general',
       name: typeof g === 'object' ? String(g.name || '').trim() : '',
+      memberCount: typeof g === 'object' && Number.isFinite(Number(g.memberCount)) ? Number(g.memberCount) : null,
+      marketingTags: typeof g === 'object' && Array.isArray(g.marketingTags) ? [...new Set(g.marketingTags.map((tag) => String(tag).trim().toUpperCase()).filter(Boolean))] : [],
+      projectTags: typeof g === 'object' && Array.isArray(g.projectTags) ? [...new Set(g.projectTags.map((tag) => String(tag).trim()).filter(Boolean))] : [],
+      projectIds: typeof g === 'object' && Array.isArray(g.projectIds) ? [...new Set(g.projectIds.map((tag) => String(tag).trim()).filter(Boolean))] : [],
+      notes: typeof g === 'object' ? String(g.notes || '') : '',
     }))
     .filter((g) => g.url)
   const bad = items.filter((g) => !/facebook\.com\/groups\//i.test(g.url))
@@ -1031,8 +1251,59 @@ app.get('/api/postsets', (_req, res) => {
   res.json({ postsets: listSets() })
 })
 
+app.post('/api/marketing-plan/preview', (req, res) => {
+  try { res.json({ plan: previewMarketingPlan(req.body?.plan, { sets: listSets(), groups: loadGroupsFull() }) }) }
+  catch (error) { res.status(400).json({ error: error.message }) }
+})
+app.post('/api/marketing-plan/apply', async (req, res) => {
+  try {
+    const parsed = parseMarketingPlan(req.body?.plan)
+    const groups = loadGroupsFull()
+    const projects = propertyData.listProjects()
+    const accountIds = listAccounts().filter((account) => account.ready).map((account) => account.id)
+    const memberships = (accountId, groupUrl) => groupMembershipFor(accountId, groupUrl)
+    const resolvedProperties = []
+    const slotsByAccount = Object.fromEntries(accountIds.map((id) => [id, []]))
+    for (const item of parsed.properties) {
+      let postSet = listSets().find((set) => new RegExp(`(^|\\s)${item.cd}(?:\\s|$)`, 'i').test(`${set.name}\n${set.text}`))
+      let importStatus = postSet ? 'READY' : 'NEED_IMPORT'
+      let importError = null
+      if (!postSet) {
+        try {
+          const sourceUrl = await resolveJsaPropertyUrlByCd(item.cd)
+          const imported = await importJsaProperty(sourceUrl)
+          if (!String(imported.text || '').trim() && !(imported.images || []).length) throw Object.assign(new Error('ไม่พบข้อมูลทรัพย์จาก JSA'), { code: 'IMPORT_FAILED' })
+          postSet = createSet({ ...imported, sourceUrl })
+          includeAutoCampaignPostSet(postSet.id)
+          importStatus = 'READY'
+        } catch (error) {
+          importError = error?.code || 'IMPORT_FAILED'
+          importStatus = 'IMPORT_FAILED'
+        }
+      }
+      const resolvedProjectId = resolveProjectId(item, projects, postSet ? `${postSet.name}\n${postSet.text}` : '')
+      const base = { ...item, projectId: resolvedProjectId, postSetId: postSet?.id || null }
+      const placementResult = postSet && !(item.projectSpecific && !resolvedProjectId) ? buildPlanPlacements(base, groups, accountIds, memberships) : { groups: [], placements: [], rounds: [] }
+      const status = !postSet ? 'IMPORT_FAILED' : (item.projectSpecific && !resolvedProjectId ? 'PROJECT_UNRESOLVED' : placementResult.groups.length === 0 ? 'NO_MATCHING_GROUP' : placementResult.placements.length < item.placements ? 'NO_MEMBER_ACCOUNT' : 'READY')
+      for (const placement of placementResult.placements) slotsByAccount[placement.accountId]?.push({ postSetId: postSet.id, group: placement.group, time: placement.preferredTimeWindow?.start || '09:00', round: placement.round })
+      resolvedProperties.push({ ...item, resolvedProjectId, postSetId: postSet?.id || null, importStatus, importError, resolvedGroups: placementResult.groups.slice(0, item.placements), eligibleAccounts: [...new Set(placementResult.placements.map((p) => p.accountId))], placements: placementResult.placements, rounds: placementResult.rounds, status })
+    }
+    const usedAccounts = accountIds.filter((id) => slotsByAccount[id]?.length)
+    const startDate = new Date(Date.now() + 7 * 3600000).toISOString().slice(0, 10)
+    const accountRules = Object.fromEntries(usedAccounts.map((id) => [id, { startDate, repeatDaily: true, slots: slotsByAccount[id] }]))
+    const campaign = usedAccounts.length ? saveAutoCampaign({ mode: 'account_schedule', enabled: false, accountIds: usedAccounts, accountRules, postSetIds: [], groups: [], groupMode: 'selected', postSetMode: 'all', intervalMinutes: 30, priorityNewHours: 72 }) : null
+    const planFile = path.join(process.cwd(), 'server', 'autopost', 'ai-marketing-plans.json')
+    let history = []; try { history = JSON.parse(fs.readFileSync(planFile, 'utf8')) } catch {}
+    const result = { ...parsed, importedAt: new Date().toISOString(), campaignId: campaign ? `ai_${Date.now()}` : null, properties: resolvedProperties }
+    fs.mkdirSync(path.dirname(planFile), { recursive: true }); fs.writeFileSync(planFile, JSON.stringify([...history, result], null, 2))
+    res.json({ campaign, plan: result, summary: { properties: resolvedProperties.length, ready: resolvedProperties.filter((p) => p.status === 'READY').length, failed: resolvedProperties.filter((p) => p.status !== 'READY').length, totalPlacements: resolvedProperties.reduce((n, p) => n + p.placements.length, 0) } })
+  } catch (error) { res.status(400).json({ error: error.message }) }
+})
+app.get('/api/marketing-plan/export', (_req, res) => { const file = path.join(process.cwd(), 'server', 'autopost', 'ai-marketing-plans.json'); try { res.json({ plans: JSON.parse(fs.readFileSync(file, 'utf8')) }) } catch { res.json({ plans: [] }) } })
+
 app.get('/api/postsets/jsa-session', (_req, res) => res.json(jsaSessionStatus()))
 app.post('/api/postsets/jsa-session/start', async (req, res) => {
+  if (isPosting() || sessionKeepaliveRunning || postReverifyRunning || jsaSessionKeepaliveRunning) return res.status(409).json({ error: 'Chrome กำลังทำงานเบื้องหลัง กรุณารอสักครู่แล้วลองใหม่ เพื่อป้องกันเครื่องกระตุก' })
   try { res.json(await startJsaLogin(req.body?.url)) }
   catch (error) { res.status(500).json({ error: error.message }) }
 })
@@ -1058,6 +1329,8 @@ app.post('/api/postsets/import-preview', async (req, res) => {
 
 app.post('/api/postsets/import', async (req, res) => {
   const sourceUrl = String(req.body?.url || '').trim()
+  const propertyType = req.body?.propertyType
+  const deal = req.body?.deal
   if (!sourceUrl) return res.status(400).json({ error: 'กรุณาวางลิงก์ประกาศ' })
   const duplicate = findSetBySourceUrl(sourceUrl)
   if (duplicate?.images?.length) return res.json({ postset: listSets().find((set) => set.id === duplicate.id), duplicate: true })
@@ -1065,7 +1338,7 @@ app.post('/api/postsets/import', async (req, res) => {
     const isJsaAdmin = (() => { try { return /(^|\.)jsa\.co\.th$/i.test(new URL(sourceUrl).hostname) && /^\/admin\/property\/view\//i.test(new URL(sourceUrl).pathname) } catch { return false } })()
     const imported = isJsaAdmin ? await importJsaProperty(sourceUrl) : await importPropertyUrl(sourceUrl)
     if (!String(imported.text || '').trim() && !(imported.images || []).length) throw new Error('ไม่พบข้อความหรือรูปจากประกาศนี้')
-    const postset = duplicate ? refreshImportedSet(duplicate.id, imported) : createSet(imported)
+    const postset = duplicate ? refreshImportedSet(duplicate.id, { ...imported, propertyType, deal }) : createSet({ ...imported, propertyType, deal })
     includeAutoCampaignPostSet(postset.id)
     res.json({ postset })
   } catch (error) {
@@ -1075,18 +1348,18 @@ app.post('/api/postsets/import', async (req, res) => {
 })
 
 app.post('/api/postsets', (req, res) => {
-  const { name, text, images, sourceUrl } = req.body || {}
+  const { name, text, images, sourceUrl, kind, propertyType, deal } = req.body || {}
   if (!String(text || '').trim() && !(images || []).length) {
     return res.status(400).json({ error: 'ต้องมีข้อความหรือรูปภาพอย่างน้อยหนึ่งอย่าง' })
   }
   const duplicate = sourceUrl && findSetBySourceUrl(sourceUrl)
   if (duplicate) return res.status(409).json({ error: `ลิงก์นี้ถูกนำเข้าแล้วในชุด “${duplicate.name}”` })
-  res.json({ postset: createSet({ name, text, images, sourceUrl }) })
+  res.json({ postset: createSet({ name, text, images, sourceUrl, kind, propertyType, deal }) })
 })
 
 app.put('/api/postsets/:id', (req, res) => {
-  const { name, text, keepImages, newImages, imageOrder } = req.body || {}
-  const updated = updateSet(req.params.id, { name, text, keepImages, newImages, imageOrder })
+  const { name, text, keepImages, newImages, imageOrder, deal, propertyType, kind } = req.body || {}
+  const updated = updateSet(req.params.id, { name, text, keepImages, newImages, imageOrder, deal, propertyType, kind })
   if (!updated) return res.status(404).json({ error: 'not found' })
   res.json({ postset: updated })
 })
@@ -1227,14 +1500,6 @@ app.get('/api/schedules/:id/run', async (req, res) => {
   }
 
   const id = req.params.id
-  const postingSettings = getPostingSettings()
-  if (!isWithinPostingWindow(new Date(), postingSettings)) {
-    const nextStart = nextPostingWindowStart(new Date(), postingSettings)
-    send('fail', {
-      error: `อยู่นอกเวลาทำงาน ${postingSettings.startTime}–${postingSettings.endTime} น. ระบบจะเปิดอีกครั้ง ${nextStart.toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' })}`,
-    })
-    return res.end()
-  }
   if (!canPost()) {
     send('fail', { error: 'ยังไม่มี session — รัน "npm run login" ก่อน' })
     return res.end()
@@ -1291,13 +1556,18 @@ app.put('/api/keywords', (req, res) => {
   }
 })
 
-const recoveredSchedules = recoverInterruptedSchedules()
-if (recoveredSchedules) console.warn(`  ⚠️ กู้ ${recoveredSchedules} รายการที่ค้างสถานะกำลังโพสต์จากรอบก่อน`)
-if (reclassifyUnverifiedAcceptedSchedules()) {
-  console.warn('  🕓 ปรับผลเก่าที่ไม่มี permalink จาก “สำเร็จ” เป็น “ยังไม่ยืนยัน” แล้ว')
-}
-
+let apiListening = false
 app.listen(PORT, () => {
+  // Mutate persistent queue state only after this process owns the API port.
+  // A duplicate process that fails with EADDRINUSE must never mark the real
+  // worker's active schedules as interrupted.
+  const recoveredSchedules = recoverInterruptedSchedules()
+  if (recoveredSchedules) console.warn(`  ⚠️ กู้ ${recoveredSchedules} รายการที่ค้างสถานะกำลังโพสต์จากรอบก่อน`)
+  if (reclassifyUnverifiedAcceptedSchedules()) {
+    console.warn('  🕓 ปรับผลเก่าที่ไม่มี permalink จาก “สำเร็จ” เป็น “ยังไม่ยืนยัน” แล้ว')
+  }
+  apiListening = true
+  if (AUTOPOST_ENABLED) checkDueSchedules()
   const groups = loadGroups()
   console.log(`\n  ✅ API ready → http://localhost:${PORT}`)
   console.log(`     Gemini:   ${GEMINI_KEY ? `configured (${GEMINI_MODEL})` : 'NOT set (keyword fallback)'}`)
@@ -1316,7 +1586,13 @@ const SESSION_KEEPALIVE_MS = Math.max(
 )
 let sessionKeepaliveRunning = false
 async function keepFacebookSessionsWarm() {
-  if (sessionKeepaliveRunning) return
+  if (sessionKeepaliveRunning || interactiveAccountBrowserOpen() || jsaSessionStatus().loginOpen) return
+  if (listAccounts().some((account) => isPosting(account.id))) {
+    const retry = setTimeout(keepFacebookSessionsWarm, 5 * 60_000)
+    retry.unref()
+    console.log('  ⏳ เลื่อนต่ออายุ Facebook Session เพราะมีงานกำลังโพสต์')
+    return
+  }
   sessionKeepaliveRunning = true
   try {
     const accounts = await listAccountsVerified({ force: true })
@@ -1333,6 +1609,27 @@ sessionKeepaliveTimer.unref()
 const initialSessionKeepaliveTimer = setTimeout(keepFacebookSessionsWarm, 30_000)
 initialSessionKeepaliveTimer.unref()
 
+// Keep JSA authentication available for manual imports.
+const JSA_SESSION_KEEPALIVE_MS = Math.max(30 * 60_000, Number(process.env.JSA_SESSION_KEEPALIVE_MS) || 2 * 60 * 60_000)
+let jsaSessionKeepaliveRunning = false
+async function keepJsaSessionWarm() {
+  if (!AUTOPOST_ENABLED || !apiListening || jsaSessionKeepaliveRunning || sessionKeepaliveRunning || postReverifyRunning) return
+  if (!jsaSessionStatus().connected || jsaSessionStatus().loginOpen || interactiveAccountBrowserOpen() || isPosting()) return
+  jsaSessionKeepaliveRunning = true
+  try {
+    const status = await refreshJsaSession()
+    if (!status.skipped) console.log(`  🔄 ต่ออายุ JSA Session แล้ว${status.lastRefreshedAt ? ` · ${status.lastRefreshedAt}` : ''}`)
+  } catch (error) {
+    console.warn(`  ⚠️ ต่ออายุ JSA Session ไม่สำเร็จ: ${error.message}`)
+  } finally {
+    jsaSessionKeepaliveRunning = false
+  }
+}
+const jsaSessionKeepaliveTimer = setInterval(keepJsaSessionWarm, JSA_SESSION_KEEPALIVE_MS)
+jsaSessionKeepaliveTimer.unref()
+const initialJsaSessionKeepaliveTimer = setTimeout(keepJsaSessionWarm, 2 * 60_000)
+initialJsaSessionKeepaliveTimer.unref()
+
 // ---------------------------------------------------------------------------
 // Auto-post scheduler. It sets a timer for the nearest due item (with a short
 // fallback check), and is also called immediately on startup. This prevents a
@@ -1346,13 +1643,24 @@ initialSessionKeepaliveTimer.unref()
 // it is marked as failed rather than being left as a misleading "pending" row.
 // ---------------------------------------------------------------------------
 const STALE_MS = 60 * 60 * 1000 // skip schedules overdue by more than 60 min
-const MAX_SCHEDULER_WAIT_MS = 30_000
+const MAX_SCHEDULER_WAIT_MS = 5_000
 let nextDueTimer = null
 
 function markStaleSchedules(now) {
+  const knownAccountIds = new Set(listAccounts().map((account) => account.id))
   for (const schedule of listSchedules()) {
     if (schedule.status !== 'pending' || inflightRuns.has(schedule.id)) continue
-    if (!accountSessionReady(schedule.accountId || 'primary')) continue
+    const accountId = schedule.accountId || 'primary'
+    if (!knownAccountIds.has(accountId)) {
+      const message = 'บัญชีของคิวนี้ถูกลบแล้ว — ปิดคิวเก่าเพื่อไม่ให้กีดขวางงานปัจจุบัน'
+      updateSchedule(schedule.id, {
+        status: 'failed',
+        results: (schedule.groups || []).map((group) => ({ group, ok: false, error: message, at: new Date().toISOString() })),
+        finishedAt: new Date().toISOString(),
+      })
+      continue
+    }
+    if (!accountSessionReady(accountId)) continue
     const dueAt = new Date(schedule.runAt).getTime()
     if (!Number.isFinite(dueAt) || dueAt > now || now - dueAt <= STALE_MS) continue
 
@@ -1372,7 +1680,8 @@ function scheduleNextDueCheck() {
   if (!AUTOPOST_ENABLED) return
   if (nextDueTimer) clearTimeout(nextDueTimer)
   const now = Date.now()
-  const nextAt = listSchedules()
+  const plannedSchedules = listSchedules()
+  const nextAt = plannedSchedules
     .filter((schedule) => schedule.status === 'pending' && !inflightRuns.has(schedule.id))
     .map((schedule) => new Date(schedule.runAt).getTime())
     .filter(Number.isFinite)
@@ -1391,38 +1700,16 @@ function scheduleNextDueCheck() {
 }
 
 function checkDueSchedules() {
-  if (!AUTOPOST_ENABLED) return
-  const now = Date.now()
-  const postingSettings = getPostingSettings()
-  if (!isWithinPostingWindow(new Date(now), postingSettings)) {
-    const due = listSchedules()
-      .filter((schedule) => schedule.status === 'pending' && !inflightRuns.has(schedule.id))
-      .filter((schedule) => schedule.manualOverride !== true)
-      .filter((schedule) => {
-        const dueAt = new Date(schedule.runAt).getTime()
-        return Number.isFinite(dueAt) && dueAt <= now
-      })
-      .sort((a, b) => new Date(a.runAt) - new Date(b.runAt))
-    const firstSlot = nextPostingWindowStart(new Date(now), postingSettings).getTime()
-    const slotsByAccount = new Map()
-    for (const schedule of due) {
-      const accountId = schedule.accountId || 'primary'
-      let slot = slotsByAccount.get(accountId) || firstSlot
-      while (!isWithinPostingWindow(new Date(slot), postingSettings)) {
-        slot = nextPostingWindowStart(new Date(slot + 60_000), postingSettings).getTime()
-      }
-      updateSchedule(schedule.id, { runAt: new Date(slot).toISOString() })
-      slotsByAccount.set(accountId, slot + 30 * 60_000)
-    }
-    const hasImmediateOverride = listSchedules().some((schedule) =>
-      schedule.status === 'pending'
-      && schedule.manualOverride === true
-      && new Date(schedule.runAt).getTime() <= now)
-    if (!hasImmediateOverride) {
-      scheduleNextDueCheck()
-      return
-    }
+  if (!AUTOPOST_ENABLED || !apiListening) return
+  if (interactiveAccountBrowserOpen() || jsaSessionStatus().loginOpen) {
+    scheduleNextDueCheck()
+    return
   }
+  const now = Date.now()
+  recoverRetryableBrowserFailures(now)
+  // Always turn a due campaign clock into a persistent schedule before any
+  // background browser can defer publishing. This removes the old state where
+  // the UI showed a time in the past but there was no queue item to execute.
   const readyAccountIds = listAccounts().filter((account) => account.ready).map((account) => account.id)
   const autoCreated = materializeAutoCampaign({
     sets: listSets(),
@@ -1433,14 +1720,35 @@ function checkDueSchedules() {
     console.log(`  ♻️ สร้างคิวอัตโนมัติ ${autoCreated.length} รายการ แยกตามบัญชี`)
   }
   markStaleSchedules(now)
+  // The session warmer also launches Chrome. Never begin a publishing browser
+  // while it is active; keepFacebookSessionsWarm performs the inverse check,
+  // so the two jobs cannot race regardless of which timer fires first.
+  if (sessionKeepaliveRunning) {
+    scheduleNextDueCheck()
+    return
+  }
   if (!canPost()) {
     scheduleNextDueCheck()
     return
   }
-  const schedules = listSchedules()
-  const accountIds = [...new Set(schedules.map((schedule) => schedule.accountId || 'primary'))]
+  // A single Mac Chrome instance can consume several GB while Facebook is
+  // composing photos. Running one browser per account concurrently eventually
+  // drives macOS into heavy memory compression and makes every timer/API look
+  // frozen. Keep account clocks independent but execute browser work serially.
+  if (isPosting()) {
+    scheduleNextDueCheck()
+    return
+  }
+  const currentCampaign = getAutoCampaign()
+  const schedules = listSchedules().filter((run) => run.source !== 'auto' || (currentCampaign.enabled && currentCampaign.accountIds.includes(run.accountId)))
+  // Owner-direct inventory is paid/priority marketing. Once an Owner burst is
+  // created, finish every spaced group in that burst before ordinary JSA work.
+  // Keeping future Owner items in this filtered list also prevents a normal
+  // post from slipping into the deliberate 30-minute safety gaps.
+  const eligibleSchedules = schedules
+  const accountIds = [...new Set(eligibleSchedules.map((schedule) => schedule.accountId || 'primary'))]
   const dueSchedules = selectConcurrentDueSchedules({
-    schedules,
+    schedules: eligibleSchedules,
     now,
     inflightIds: [...inflightRuns],
     runningAccountIds: accountIds.filter((accountId) => isPosting(accountId)),
@@ -1451,7 +1759,7 @@ function checkDueSchedules() {
     scheduleNextDueCheck()
     return
   }
-  for (const due of dueSchedules) {
+  for (const due of dueSchedules.slice(0, 1)) {
     const accountId = due.accountId || 'primary'
     inflightRuns.add(due.id)
     console.log(`  ⏰  auto-post [${accountId}]: "${due.name}" ถึงเวลาแล้ว → ${due.groups.length} กลุ่ม`)
@@ -1463,4 +1771,47 @@ function checkDueSchedules() {
       })
   }
 }
-if (AUTOPOST_ENABLED) checkDueSchedules()
+
+function recoverRetryableBrowserFailures(now = Date.now()) {
+  for (const schedule of listSchedules()) {
+    if (schedule.status !== 'failed' || Number(schedule.autoRetryCount || 0) >= 2) continue
+    const results = schedule.results || []
+    const browserClosedBeforeSubmit = results.length > 0 && results.every((result) => {
+      const message = String(result.error || '')
+      return !result.submitted && /target page, context or browser has been closed|browser.*closed|context.*closed/i.test(message)
+    })
+    if (!browserClosedBeforeSubmit) continue
+    const failedAt = Date.parse(schedule.finishedAt || schedule.updatedAt || 0) || 0
+    if (now - failedAt < 30_000) continue
+    updateSchedule(schedule.id, {
+      status: 'pending',
+      runAt: new Date(now).toISOString(),
+      results: [],
+      finishedAt: null,
+      autoRetryCount: Number(schedule.autoRetryCount || 0) + 1,
+      autoRetryReason: 'browser-closed-before-submit',
+    })
+    console.warn(`  ♻️ กู้คิว ${schedule.id} อัตโนมัติ เพราะเบราว์เซอร์ปิดก่อนกดโพสต์`)
+  }
+}
+
+// Permalink indexing can lag behind the composer acknowledgement. Verify one
+// submitted result at a time and never resubmit the room while it is pending.
+const POST_REVERIFY_INTERVAL_MS = Math.max(60_000, Number(process.env.POST_REVERIFY_INTERVAL_MS) || 2 * 60_000)
+// Recovery is part of normal posting, not an opt-in maintenance task. It only
+// searches for already-submitted posts and never presses the Post button.
+const POST_REVERIFY_ENABLED = process.env.POST_REVERIFY_ENABLED !== 'false'
+let postReverifyRunning = false
+async function runPostReverification() {
+  if (!AUTOPOST_ENABLED || !POST_REVERIFY_ENABLED || postReverifyRunning) return
+  postReverifyRunning = true
+  try {
+    await reverifyUnconfirmedSchedules({ maxResults: 3, onStep: (message) => console.log(`  ${message}`) })
+  } finally {
+    postReverifyRunning = false
+  }
+}
+const postReverifyTimer = setInterval(runPostReverification, POST_REVERIFY_INTERVAL_MS)
+postReverifyTimer.unref()
+const initialPostReverifyTimer = setTimeout(runPostReverification, 45_000)
+initialPostReverifyTimer.unref()

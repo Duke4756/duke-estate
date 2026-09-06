@@ -5,9 +5,7 @@ const MODES = [
 ]
 
 const APP_ROLE = import.meta.env.VITE_APP_ROLE || 'all'
-const visibleModes = APP_ROLE === 'search'
-  ? MODES.filter((mode) => mode.id !== 'autopost')
-  : APP_ROLE === 'autopost'
+const visibleModes = APP_ROLE === 'autopost' || APP_ROLE === 'search'
     ? MODES.filter((mode) => mode.id === 'autopost')
     : MODES
 
@@ -20,8 +18,8 @@ export default function Header({ appMode, onMode }) {
             🏠
           </div>
           <div className="hidden md:block">
-            <h1 className="text-lg font-bold text-slate-800 leading-tight">{APP_ROLE === 'search' ? 'Duke Estate Intelligence' : 'Duke Estate'}</h1>
-            <p className="text-xs text-slate-500">{APP_ROLE === 'search' ? 'ฐานเจ้าของและทรัพย์จาก Facebook' : 'ระบบจัดการอสังหาริมทรัพย์'}</p>
+            <h1 className="text-lg font-bold text-slate-800 leading-tight">Duke Estate</h1>
+            <p className="text-xs text-slate-500">ระบบจัดการอสังหาริมทรัพย์</p>
           </div>
         </div>
 

@@ -8,14 +8,14 @@ import {
   streamScheduleRun,
   getHealth,
   getAccounts,
-  getPostingSettings,
-  updatePostingSettings,
   createPostSetFromUrl,
   disconnectJsaSession,
   finishJsaSession,
   getJsaSession,
   startJsaSession,
   reorderPostSets,
+  previewMarketingPlan,
+  applyMarketingPlan,
 } from '../api'
 import PostSetEditor from './PostSetEditor'
 import ScheduleEditor from './ScheduleEditor'
@@ -26,6 +26,30 @@ import { filterAndSortSchedules, paginateSchedules } from './scheduleQueue'
 const labelOf = (u) => (u.match(/groups\/([^/?]+)/) || [])[1] || u
 const scheduledAt = (runAt) =>
   new Date(runAt).toLocaleString('th-TH', { dateStyle: 'medium', timeStyle: 'short' })
+const categoryMeta = (value) => ({
+  'condo-rent': { propertyType: 'condo', deal: 'rent' },
+  'condo-sale': { propertyType: 'condo', deal: 'sale' },
+  'house-rent': { propertyType: 'house', deal: 'rent' },
+  'house-sale': { propertyType: 'house', deal: 'sale' },
+}[value] || {})
+
+function SystemHealthBar() {
+  const [overview, setOverview] = useState(null)
+  const [uiLag, setUiLag] = useState(0)
+  useEffect(() => {
+    let stopped = false
+    const refresh = () => getSystemOverview().then((value) => { if (!stopped) setOverview(value) }).catch(() => {})
+    refresh(); const poll = setInterval(refresh, 15000)
+    let expected = performance.now() + 1000
+    const probe = setInterval(() => { const now = performance.now(); setUiLag(Math.max(0, Math.round(now - expected))); expected = now + 1000 }, 1000)
+    return () => { stopped = true; clearInterval(poll); clearInterval(probe) }
+  }, [])
+  if (!overview) return null
+  const browserHealth = uiLag > 500 ? 'critical' : uiLag > 150 ? 'warning' : 'healthy'
+  const health = overview.health === 'critical' || browserHealth === 'critical' ? 'critical' : overview.health === 'warning' || browserHealth === 'warning' ? 'warning' : 'healthy'
+  const tone = health === 'critical' ? 'border-rose-200 bg-rose-50 text-rose-700' : health === 'warning' ? 'border-amber-200 bg-amber-50 text-amber-700' : 'border-emerald-200 bg-emerald-50 text-emerald-700'
+  return <details className={`rounded-2xl border px-4 py-3 ${tone}`}><summary className="cursor-pointer list-none text-sm font-black"><span>{health === 'healthy' ? '● ระบบลื่นไหล' : health === 'warning' ? '● ระบบเริ่มช้า' : '● ระบบทำงานหนัก'}</span><span className="ml-3 font-medium opacity-80">DB {overview.database.properties.toLocaleString()} ทรัพย์ · คิว {overview.posting.pending} · ปัญหา {overview.posting.failed} · Backend {overview.performance.eventLoopLagMs}ms · หน้านี้ {uiLag}ms</span><span className="float-right">⌄</span></summary><div className="mt-3 grid grid-cols-2 gap-2 text-xs md:grid-cols-4"><span>โพสต์ดิบ {overview.database.rawPosts.toLocaleString()}</span><span>ทรัพย์ในสต็อก {overview.database.companySets}</span><span>หลักฐาน {overview.posting.evidence} ภาพ</span><span>RAM {overview.performance.rssMb}MB · Heap {overview.performance.heapMb}MB</span></div><p className="mt-2 text-[11px] opacity-70">วัดทุก 15 วินาทีและ cache ฝั่ง server 10 วินาที ไม่เปิด browser หรือสแกนข้อมูลหนักเพิ่ม</p></details>
+}
 
 function PostSetCard({ set, selected, onSelect, onEdit, onDelete, onDragStart, onDrop }) {
   const preview = set.images?.[0]?.url
@@ -47,7 +71,7 @@ function PostSetCard({ set, selected, onSelect, onEdit, onDelete, onDragStart, o
         <div className="h-20 bg-gradient-to-br from-slate-50 to-slate-100 grid place-items-center text-2xl">📝</div>
       )}
       <div className="p-3 flex-1 flex flex-col">
-        <p className="text-sm font-bold text-slate-800 truncate">{set.name}</p>
+        <div className="flex items-center justify-between gap-2"><p className="text-sm font-bold text-slate-800 truncate">{set.name}</p><span className="shrink-0 rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-bold text-indigo-700">{set.kind === 'house' ? 'บ้าน' : 'คอนโด'} · {set.deal === 'sale' ? 'ขาย' : 'เช่า'}</span></div>
         <p className="mt-1 text-xs text-slate-500 line-clamp-3 whitespace-pre-line flex-1">
           {set.text || <span className="italic text-slate-300">ไม่มีข้อความ</span>}
         </p>
@@ -84,6 +108,9 @@ function PostSetsPanel() {
   const [selectedSetIds, setSelectedSetIds] = useState([])
   const [draggedSetId, setDraggedSetId] = useState(null)
   const [importProgress, setImportProgress] = useState('')
+  const [planJson, setPlanJson] = useState('')
+  const [planPreview, setPlanPreview] = useState(null)
+  const [category, setCategory] = useState('all')
 
   function refresh() {
     setLoading(true)
@@ -97,6 +124,11 @@ function PostSetsPanel() {
     refresh()
     getJsaSession().then(setJsaSession).catch(() => {})
   }, [])
+
+  async function previewPlan() {
+    try { setPlanPreview(await previewMarketingPlan(planJson)) } catch (e) { setError(e.message) }
+  }
+  async function applyPlan() { try { await applyMarketingPlan(planJson); setImportedName('นำเข้าแผนและสร้างการตั้งค่าแล้ว') } catch (e) { setError(e.message) } }
 
   function queueImport(value = quickUrl) {
     const urls = [...new Set(String(value || '').match(/https?:\/\/[^\s,]+/gi) || [])]
@@ -114,7 +146,7 @@ function PostSetsPanel() {
     setError(null)
     setImportProgress('กำลังดึงข้อมูลและรูป…')
     try {
-      const postset = await createPostSetFromUrl(url)
+      const postset = await createPostSetFromUrl(url, categoryMeta(category))
       setImportedName(postset.duplicateImport ? 'ข้ามลิงก์เดิมที่เคยนำเข้าแล้ว' : `สร้าง “${postset.name}” แล้ว`)
       if (!postset.duplicateImport) refresh()
     } catch (e) {
@@ -181,9 +213,10 @@ function PostSetsPanel() {
 
   return (
     <div className="space-y-4">
+      <div className="rounded-2xl border border-violet-200 bg-violet-50 p-4"><h3 className="text-sm font-bold text-violet-900">🤖 AI Marketing Plan</h3><p className="mt-1 text-xs text-violet-700">เลือกไฟล์ JSON หรือวางข้อมูลแผนการตลาดเพื่อ preview ก่อนใช้</p><input type="file" accept="application/json,.json" onChange={(e) => { const file = e.target.files?.[0]; if (file) file.text().then(setPlanJson) }} className="mt-2 block w-full text-xs" /><textarea value={planJson} onChange={(e) => setPlanJson(e.target.value)} rows={3} placeholder="{ &quot;version&quot;: 1, &quot;campaign&quot;: &quot;PM-W37&quot;, &quot;properties&quot;: [] }" className="mt-2 w-full rounded-xl border border-violet-200 bg-white p-2 text-xs" /><button type="button" onClick={previewPlan} disabled={!planJson.trim()} className="mt-2 rounded-lg bg-violet-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-40">Preview</button>{planPreview && <button type="button" onClick={applyPlan} className="ml-2 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white">Apply Plan</button>}{planPreview && <div className="mt-3 space-y-1 text-xs text-violet-900">{planPreview.properties.map((item) => <div key={item.cd} className="rounded-lg bg-white p-2"><b>{item.cd}</b> · {item.status} · Tags: {item.groupTags.join(', ') || '-'} · กลุ่มที่พบ {item.resolvedGroups.length}/{item.placements}</div>)}</div>}</div>
       <div className="rounded-2xl border border-indigo-200 bg-gradient-to-r from-indigo-50 to-white p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <div><h3 className="text-sm font-bold text-indigo-900">วางลิงก์ JSA แล้วสร้างโพสต์ทันที</h3><p className="mt-0.5 text-xs text-indigo-600">ระบบดึงรายละเอียดและรูปทั้งหมด สร้างชุดโพสต์ และนำเข้าสู่ระบบอัตโนมัติในครั้งเดียว</p></div>
+          <div><h3 className="text-sm font-bold text-indigo-900">เพิ่มทรัพย์ด้วยตนเองจากลิงก์ JSA</h3><p className="mt-0.5 text-xs text-indigo-600">วางลิงก์เพื่อดึงรายละเอียดและรูป แล้วตรวจสอบก่อนบันทึกเข้าสต็อกด้วยตนเอง</p></div>
           <div className="flex items-center gap-2">
             <span className={`text-[11px] font-bold ${jsaSession.connected ? 'text-emerald-700' : jsaSession.loginOpen ? 'text-amber-700' : 'text-slate-500'}`}>{jsaSession.connected ? '● JSA พร้อมใช้' : jsaSession.loginOpen ? '● รอยืนยันล็อกอิน' : '○ ยังไม่เชื่อม JSA'}</span>
             {!jsaSession.loginOpen && <button type="button" disabled={sessionBusy} onClick={() => sessionAction(() => startJsaSession(quickUrl || undefined))} className="rounded-lg border border-indigo-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-indigo-700 disabled:opacity-50">{jsaSession.connected ? 'ล็อกอินใหม่' : 'เชื่อมต่อ JSA'}</button>}
@@ -195,7 +228,7 @@ function PostSetsPanel() {
           <textarea rows={2} value={quickUrl} onChange={(event) => setQuickUrl(event.target.value)} onPaste={(event) => {
             const pasted = event.clipboardData.getData('text').trim()
             if (/https?:\/\//i.test(pasted)) { event.preventDefault(); queueImport(pasted) }
-          }} placeholder="วางลิงก์ได้ต่อเนื่อง แม้ระบบกำลังนำเข้าหรือกำลังโพสต์" className="min-w-0 flex-1 resize-y rounded-xl border border-indigo-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-indigo-500" />
+          }} placeholder="วางลิงก์ทรัพย์ที่ต้องการเพิ่มด้วยตนเอง" className="min-w-0 flex-1 resize-y rounded-xl border border-indigo-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-indigo-500" />
           <button type="button" onClick={() => queueImport()} disabled={!quickUrl.trim()} className="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-bold text-white disabled:opacity-50">{quickImporting ? 'เพิ่มเข้าคิว' : 'สร้างโพสต์ทันที'}</button>
         </div>
         {(quickImporting || importQueue.length > 0) && <p className="mt-2 text-xs font-semibold text-indigo-700">⏳ {quickImporting ? importProgress || 'กำลังนำเข้า…' : 'รอเริ่มนำเข้า'}{importQueue.length ? ` · รออีก ${importQueue.length} ลิงก์` : ''} · วางลิงก์ต่อได้ทันที</p>}
@@ -203,10 +236,10 @@ function PostSetsPanel() {
       </div>
       <div className="flex items-center justify-between gap-3">
         <p className="text-sm text-slate-500">
-          สร้าง “ชุดของโพสต์” (ข้อความ + รูป) ไว้ใช้โพสต์อัตโนมัติ — เก็บบนเครื่องนี้เท่านั้น
+          สต็อกทรัพย์ (ข้อความ + รูป) — โพสต์แล้วเก็บไว้จนกว่าจะลบเอง
         </p>
         <button
-          onClick={() => setEditor({ open: true, set: null })}
+          onClick={() => setEditor({ open: true, set: null, category: categoryMeta(category) })}
           className="shrink-0 rounded-xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700"
         >
           ＋ สร้างชุดโพสต์
@@ -214,6 +247,7 @@ function PostSetsPanel() {
       </div>
 
       {sets.length > 0 && <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+        <div className="flex flex-wrap items-center gap-2"><button type="button" onClick={() => setCategory('all')} className={`rounded-lg px-2.5 py-1 text-xs font-bold ${category === 'all' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-600'}`}>ทั้งหมด</button><div className="flex items-center gap-1 rounded-lg border border-slate-200 bg-white p-1"><span className="px-1 text-[11px] font-black text-slate-500">คอนโด</span>{[['condo-rent','เช่า'],['condo-sale','ขาย']].map(([value,label]) => <button key={value} type="button" onClick={() => setCategory(value)} className={`rounded-md px-2 py-1 text-xs font-bold ${category === value ? 'bg-indigo-600 text-white' : 'text-slate-600 hover:bg-indigo-50'}`}>{label}</button>)}</div><div className="flex items-center gap-1 rounded-lg border border-slate-200 bg-white p-1"><span className="px-1 text-[11px] font-black text-slate-500">บ้าน</span>{[['house-rent','เช่า'],['house-sale','ขาย']].map(([value,label]) => <button key={value} type="button" onClick={() => setCategory(value)} className={`rounded-md px-2 py-1 text-xs font-bold ${category === value ? 'bg-indigo-600 text-white' : 'text-slate-600 hover:bg-indigo-50'}`}>{label}</button>)}</div></div>
         <span className="text-xs text-slate-500">ลากการ์ดเพื่อจัดลำดับห้อง · เลือกหลายรายการเพื่อลบข้อมูลเก่า</span>
         <div className="flex items-center gap-2">
           <button type="button" onClick={() => setSelectedSetIds(selectedSetIds.length === sets.length ? [] : sets.map((set) => set.id))} className="text-xs font-semibold text-indigo-600">{selectedSetIds.length === sets.length ? 'ล้างที่เลือก' : 'เลือกทั้งหมด'}</button>
@@ -235,7 +269,7 @@ function PostSetsPanel() {
         </div>
       ) : (
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-          {sets.map((set) => (
+          {sets.filter((set) => category === 'all' || category === `${set.kind || 'condo'}-${set.deal || 'rent'}`).map((set) => (
             <PostSetCard
               key={set.id}
               set={set}
@@ -251,8 +285,11 @@ function PostSetsPanel() {
       )}
 
       <PostSetEditor
+        key={`${editor.open}-${editor.set?.id || 'new'}-${editor.category?.propertyType || 'condo'}-${editor.category?.deal || 'rent'}`}
         open={editor.open}
         set={editor.set}
+        propertyType={editor.category?.propertyType}
+        deal={editor.category?.deal}
         onClose={() => setEditor({ open: false, set: null })}
         onSaved={() => {
           setEditor({ open: false, set: null })
@@ -321,6 +358,7 @@ function ScheduleRow({ sch, set, accountName, canPost, running, accountBusy, onR
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5">
             <p className="text-sm font-bold text-slate-800 truncate">{sch.name}</p>
+            <span className="shrink-0 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-black text-emerald-700">ทรัพย์</span>
             {sch.source === 'auto' && (
               <span className="shrink-0 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-700">♻️ ระบบสร้าง</span>
             )}
@@ -420,6 +458,7 @@ function ScheduleRow({ sch, set, accountName, canPost, running, accountBusy, onR
                     ↗ {['accepted', 'group_card'].includes(r.verified) ? 'เปิดกลุ่ม' : 'เปิดโพสต์'}
                   </a>
                 )}
+                {r.evidenceUrl && <a href={r.evidenceUrl} target="_blank" rel="noreferrer" className="shrink-0 rounded-md bg-emerald-50 px-2 py-1 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100">📸 หลักฐาน</a>}
               </div>
               {!r.ok && r.error && (
                 <p className="mt-1 whitespace-pre-line text-[11px] leading-relaxed text-rose-600">↳ {r.error}</p>
@@ -450,18 +489,15 @@ function SchedulePanel() {
   const [sort, setSort] = useState('runSoon')
   const [pageSize, setPageSize] = useState(40)
   const [page, setPage] = useState(1)
-  const [postingSettings, setPostingSettings] = useState(null)
-  const [savingSettings, setSavingSettings] = useState(false)
 
   function load(silent = false) {
     if (!silent) setLoading(true)
     setError(null)
-    Promise.all([getSchedules(), getPostSets(), getAccounts(), getPostingSettings()])
-      .then(([s, p, a, workingHours]) => {
+    Promise.all([getSchedules(), getPostSets(), getAccounts()])
+      .then(([s, p, a]) => {
         setSchedules(s.schedules || [])
         setSets(p.postsets || [])
         setAccounts(a.accounts || [])
-        setPostingSettings(workingHours)
       })
       .catch((e) => setError(e.message))
       .finally(() => {
@@ -492,11 +528,13 @@ function SchedulePanel() {
 
   const setById = (id) => sets.find((s) => s.id === id)
   const accountNameOf = (id) => accounts.find((account) => account.id === (id || 'primary'))?.name || 'บัญชีหลัก'
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0)
+  const todaySchedules = schedules.filter((item) => Date.parse(item.finishedAt || item.runAt || item.createdAt || 0) >= todayStart.getTime())
   const counts = {
-    pending: schedules.filter((item) => item.status === 'pending').length,
-    posting: schedules.filter((item) => item.status === 'posting').length,
-    done: schedules.filter((item) => item.status === 'done').length,
-    failed: schedules.filter((item) => item.status === 'failed').length,
+    pending: todaySchedules.filter((item) => item.status === 'pending').length,
+    posting: todaySchedules.filter((item) => item.status === 'posting').length,
+    done: todaySchedules.filter((item) => item.status === 'done').length,
+    failed: todaySchedules.filter((item) => item.status === 'failed').length,
   }
   const preparedSchedules = useMemo(() => schedules.map((schedule) => ({
     ...schedule,
@@ -525,22 +563,6 @@ function SchedulePanel() {
     } catch (e) {
       setError(e.message)
       load()
-    }
-  }
-
-  async function saveWorkingHours(event) {
-    event.preventDefault()
-    if (!postingSettings?.settings) return
-    setSavingSettings(true)
-    setError(null)
-    try {
-      const saved = await updatePostingSettings(postingSettings.settings)
-      setPostingSettings(saved)
-      load(true)
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setSavingSettings(false)
     }
   }
 
@@ -604,7 +626,7 @@ function SchedulePanel() {
 
       <div className="rounded-3xl bg-gradient-to-br from-indigo-600 via-violet-600 to-purple-700 p-5 text-white shadow-lg shadow-indigo-200/60">
         <div className="flex items-center justify-between gap-4">
-          <div><p className="text-xs font-semibold uppercase tracking-widest text-indigo-100">Auto Post Dashboard</p><h2 className="mt-1 text-2xl font-bold">จัดการคิวโพสต์</h2><p className="mt-1 text-sm text-indigo-100">ตั้งเวลา ตรวจสถานะ และเลือกบัญชีที่ใช้โพสต์ได้ในที่เดียว</p></div>
+          <div><p className="text-xs font-semibold uppercase tracking-widest text-indigo-100">CENTRAL POSTING QUEUE</p><h2 className="mt-1 text-2xl font-bold">คิวโพสต์กลางเพียงคิวเดียว</h2><p className="mt-1 text-sm text-indigo-100">เห็นลำดับงานหลายวัน · บริษัท/Owner · ผลโพสต์ · หลักฐาน · ปัญหา ในหน้าเดียว</p></div>
         <button
           onClick={() => setEditor({ open: true, schedule: null })}
           className="shrink-0 rounded-xl bg-white px-4 py-2.5 text-sm font-bold text-indigo-700 shadow-sm hover:bg-indigo-50"
@@ -614,42 +636,8 @@ function SchedulePanel() {
         </div>
       </div>
 
-      {postingSettings?.settings && (
-        <form onSubmit={saveWorkingHours} className="flex flex-wrap items-end gap-3 rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
-          <div className="mr-auto">
-            <p className="text-sm font-bold text-slate-800">🕘 ช่วงเวลาทำงานรวม</p>
-            <p className="mt-0.5 text-xs text-slate-500">
-              เวลาไทย · นอกช่วงนี้คิวจะถูกเลื่อนไปรอบถัดไปอัตโนมัติ
-            </p>
-          </div>
-          <label className="text-xs font-semibold text-slate-600">
-            เริ่ม
-            <input
-              type="time"
-              value={postingSettings.settings.startTime}
-              onChange={(event) => setPostingSettings((current) => ({ ...current, settings: { ...current.settings, startTime: event.target.value } }))}
-              className="ml-2 rounded-xl border border-slate-200 px-3 py-2 text-sm"
-            />
-          </label>
-          <label className="text-xs font-semibold text-slate-600">
-            ถึง
-            <input
-              type="time"
-              value={postingSettings.settings.endTime}
-              onChange={(event) => setPostingSettings((current) => ({ ...current, settings: { ...current.settings, endTime: event.target.value } }))}
-              className="ml-2 rounded-xl border border-slate-200 px-3 py-2 text-sm"
-            />
-          </label>
-          <span className={`rounded-full px-3 py-2 text-xs font-bold ${postingSettings.withinWindow ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'}`}>
-            {postingSettings.withinWindow ? '● อยู่ในเวลาทำงาน' : '○ นอกเวลาทำงาน'}
-          </span>
-          <button disabled={savingSettings} className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-bold text-white hover:bg-indigo-700 disabled:opacity-50">
-            {savingSettings ? 'กำลังบันทึก…' : 'บันทึกเวลา'}
-          </button>
-        </form>
-      )}
-
       <div className="grid grid-cols-4 gap-2">
+        <p className="col-span-4 text-[11px] font-bold text-slate-400">สถิติวันนี้ · ตัวเลขทุกสถานะและหลักฐานรีเซ็ตพร้อมกันเวลา 00:00 น. (ประวัติจริงยังเก็บไว้ตรวจสอบ)</p>
         {[
           ['pending', 'รอโพสต์', counts.pending, 'text-indigo-700 bg-indigo-50 border-indigo-100'],
           ['posting', 'กำลังโพสต์', counts.posting, 'text-amber-700 bg-amber-50 border-amber-100'],
@@ -744,10 +732,43 @@ function SchedulePanel() {
 }
 
 const TABS = [
-  { id: 'sets', label: '📝 ชุดของโพสต์' },
-  { id: 'automatic', label: '♻️ โหมดรันอัตโนมัติ' },
+  { id: 'sets', label: '🏠 ทรัพย์' },
+  { id: 'automatic', label: '🤖 ระบบโพสต์' },
   { id: 'accounts', label: '👤 บัญชีโพสต์' },
 ]
+
+function MarketingAutomationPanel({ onOpenAccounts }) {
+  const [subtab, setSubtab] = useState('setting')
+  return <div className="space-y-5"><div className="flex w-fit rounded-xl bg-slate-200/70 p-1"><button type="button" onClick={() => setSubtab('monitor')} className={`rounded-lg px-4 py-2 text-sm font-bold ${subtab === 'monitor' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500'}`}>Monitor</button><button type="button" onClick={() => setSubtab('setting')} className={`rounded-lg px-4 py-2 text-sm font-bold ${subtab === 'setting' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500'}`}>Setting</button></div>{subtab === 'monitor' ? <AutoCampaignPanel onOpenAccounts={onOpenAccounts} showSettings={false} /> : <AutoCampaignPanel onOpenAccounts={onOpenAccounts} showSettings />}</div>
+}
+
+function UnifiedPostSetsPanel() {
+  return <PostSetsPanel />
+}
+
+function UnifiedPostingQueue() {
+  const [queue, setQueue] = useState([])
+  const [sets, setSets] = useState([])
+  useEffect(() => {
+    let stopped = false
+    const refresh = () => Promise.all([getSchedules(), getPostSets()]).then(([scheduleData, setData]) => {
+      if (stopped) return
+      const pending = (scheduleData.schedules || []).filter((item) => ['pending', 'posting'].includes(item.status))
+      const byTime = (a, b) => Date.parse(a.runAt || 0) - Date.parse(b.runAt || 0)
+      setQueue(pending.sort(byTime))
+      setSets(setData.postsets || [])
+    }).catch(() => {})
+    refresh()
+    const timer = setInterval(refresh, 5000)
+    return () => { stopped = true; clearInterval(timer) }
+  }, [])
+  const setById = useMemo(() => new Map(sets.map((set) => [set.id, set])), [sets])
+  return <section className="rounded-3xl border border-indigo-200 bg-white p-5 shadow-sm">
+    <div className="flex flex-wrap items-center justify-between gap-3"><div><div className="flex items-center gap-2"><h2 className="font-black text-slate-900">🛰️ คิวโพสต์</h2><span className="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-black text-indigo-700">{queue.length} งาน</span></div><p className="mt-1 text-xs text-slate-500">คิวโพสต์ทรัพย์ตามเวลาที่ตั้งไว้</p></div></div>
+    <div className="mt-4 grid gap-2 lg:grid-cols-2">{queue.slice(0, 6).map((item, index) => { const set = setById.get(item.postSetId); return <div key={item.id} className={`flex items-center gap-3 rounded-2xl border p-3 ${index === 0 ? 'border-indigo-300 bg-indigo-50/50 ring-1 ring-indigo-100' : 'border-slate-100'}`}><div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-emerald-100 font-black text-emerald-700">{index + 1}</div><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><span className="rounded-md bg-emerald-100 px-1.5 py-0.5 text-[10px] font-black text-emerald-700">ทรัพย์</span><p className="truncate text-sm font-bold text-slate-800">{set?.name || item.name}</p></div><p className="mt-1 text-[11px] text-slate-500">{item.accountId || 'primary'} · {item.groupMode === 'random' ? 'สุ่ม 1 กลุ่ม' : `${item.groups?.length || 0} กลุ่ม`} · {new Date(item.runAt).toLocaleString('th-TH')}</p></div><span className={`text-[11px] font-bold ${item.status === 'posting' ? 'text-orange-600' : 'text-indigo-600'}`}>{item.status === 'posting' ? '● กำลังโพสต์' : index === 0 ? 'คิวถัดไป' : 'รอคิว'}</span></div>})}{queue.length === 0 && <div className="col-span-full rounded-2xl bg-slate-50 p-5 text-center text-sm text-slate-400">ยังไม่มีงานรอโพสต์ · ระบบจะสร้างคิวเมื่อถึงรอบ</div>}</div>
+    {queue.length > 6 && <p className="mt-2 text-right text-xs text-slate-400">และอีก {queue.length - 6} งานในคิว</p>}
+  </section>
+}
 
 export default function AutoPostView() {
   const [tab, setTab] = useState('automatic')
@@ -767,7 +788,7 @@ export default function AutoPostView() {
         ))}
       </div>
 
-      {tab === 'sets' ? <PostSetsPanel /> : tab === 'accounts' ? <AccountsPanel /> : <AutoCampaignPanel onOpenAccounts={() => setTab('accounts')} />}
+      {tab === 'sets' ? <UnifiedPostSetsPanel /> : tab === 'accounts' ? <AccountsPanel /> : <MarketingAutomationPanel onOpenAccounts={() => setTab('accounts')} />}
     </main>
   )
 }

@@ -80,7 +80,28 @@ export function findSetBySourceUrl(sourceUrl) {
   return normalized ? read().find((set) => normalizeSourceUrl(set.sourceUrl) === normalized) || null : null
 }
 
-export function createSet({ name, text, images, sourceUrl }) {
+export function postSetDeal(set = {}) {
+  const explicit = String(set.deal || '').trim().toLowerCase()
+  if (explicit === 'rent' || explicit === 'sale') return explicit
+  const content = `${set.name || ''}\n${set.text || ''}`
+  if (/ราคาขาย|(^|\s)ขาย(?:\s|$)/u.test(content)) return 'sale'
+  if (/ราคาเช่า|ให้เช่า|(^|\s)เช่า(?:\s|$)/u.test(content)) return 'rent'
+  return 'unknown'
+}
+
+export function isRentalPostSet(set) {
+  return postSetDeal(set) === 'rent'
+}
+
+export function postSetReference(set = {}) {
+  return `${set.name || ''}\n${set.text || ''}`.match(/\b[A-Z]{1,8}-\d{3,12}\b/i)?.[0]?.toUpperCase() || null
+}
+
+export function isPublishableRentalPostSet(set) {
+  return isRentalPostSet(set) && Boolean(postSetReference(set))
+}
+
+export function createSet({ name, text, images, sourceUrl, deal, kind, propertyType }) {
   const id = 'ps_' + Date.now()
   const set = {
     id,
@@ -88,6 +109,8 @@ export function createSet({ name, text, images, sourceUrl }) {
     text: text || '',
     images: saveImages(id, images),
     sourceUrl: normalizeSourceUrl(sourceUrl) || undefined,
+    deal: postSetDeal({ deal, name, text }),
+    kind: propertyType || kind || undefined,
     createdAt: new Date().toISOString(),
   }
   const list = read()
@@ -96,7 +119,7 @@ export function createSet({ name, text, images, sourceUrl }) {
   return toPublic(set)
 }
 
-export function refreshImportedSet(id, { name, text, images, sourceUrl }) {
+export function refreshImportedSet(id, { name, text, images, sourceUrl, deal, propertyType, kind }) {
   const list = read()
   const index = list.findIndex((set) => set.id === id)
   if (index < 0) return null
@@ -108,6 +131,8 @@ export function refreshImportedSet(id, { name, text, images, sourceUrl }) {
     text: text || current.text,
     images: saveImages(`${id}_${Date.now()}`, images),
     sourceUrl: normalizeSourceUrl(sourceUrl) || current.sourceUrl,
+    deal: postSetDeal({ deal: deal || current.deal, name: name || current.name, text: text || current.text }),
+    kind: propertyType || kind || current.kind,
     updatedAt: new Date().toISOString(),
   }
   write(list)
@@ -116,7 +141,7 @@ export function refreshImportedSet(id, { name, text, images, sourceUrl }) {
 
 // keepImages: existing filenames to keep. newImages: base64 data-URLs (or {id,url}) to add.
 // imageOrder can interleave both types: [{type:'existing', file}, {type:'new', id}].
-export function updateSet(id, { name, text, keepImages, newImages, imageOrder }) {
+export function updateSet(id, { name, text, keepImages, newImages, imageOrder, deal, propertyType, kind }) {
   const list = read()
   const i = list.findIndex((s) => s.id === id)
   if (i < 0) return null
@@ -141,6 +166,8 @@ export function updateSet(id, { name, text, keepImages, newImages, imageOrder })
     ...cur,
     name: name != null ? name.trim() || cur.name : cur.name,
     text: text != null ? text : cur.text,
+    deal: deal || cur.deal || postSetDeal({ name, text }),
+    kind: propertyType || kind || cur.kind,
     images: ordered,
     updatedAt: new Date().toISOString(),
   }

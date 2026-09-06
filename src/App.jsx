@@ -21,7 +21,7 @@ import SettingsView from './components/SettingsView'
 const APP_ROLE = import.meta.env.VITE_APP_ROLE || 'all'
 
 export default function App() {
-  const [appMode, setAppMode] = useState(APP_ROLE === 'search' ? 'owners' : 'autopost')
+  const [appMode, setAppMode] = useState('autopost')
   const [leads, setLeads] = useState([])
   const [source, setSource] = useState('demo')
   const [loading, setLoading] = useState(false)

@@ -30,6 +30,7 @@ export function createPropertyRepository(db) {
     saveRun({ rawPostId, result, metadata = {}, replacePending = false }) {
       const now = new Date().toISOString()
       const transaction = db.transaction(() => {
+        const sourceUrl = db.prepare('SELECT source_url FROM raw_posts WHERE id=?').get(rawPostId)?.source_url
         if (replacePending) retireUnreviewedProperties(db, rawPostId, now)
         const run = insertRun.run(
           rawPostId, 'completed', metadata.pipelineVersion, metadata.parserVersion,
@@ -50,6 +51,7 @@ export function createPropertyRepository(db) {
         )
         const propertyIds = []
         for (const [index, property] of result.properties.entries()) {
+          if (['agent', 'co_agent'].includes(String(property.source_role || '').toLowerCase())) continue
           const overallConfidence = overallConfidenceOf(property)
           const status = 'confirmed'
           const values = PROPERTY_COLUMNS.map((column) => property[column] ?? null)
@@ -74,6 +76,15 @@ export function createPropertyRepository(db) {
             addEvidence.run(propertyId, item.field, JSON.stringify(property[item.field] ?? null), item.quote, item.confidence)
           }
           saveTransitMatches(db, propertyId, rawPostId, property.transit_matches || [], now)
+          const qualityReasons = activeInventoryRejectionReasons(property, sourceUrl)
+          if (qualityReasons.length) {
+            const before = db.prepare('SELECT * FROM properties WHERE id=?').get(propertyId)
+            db.prepare('UPDATE properties SET deleted_at=?,updated_at=? WHERE id=?').run(now, now, propertyId)
+            db.prepare(`INSERT INTO audit_events(entity_type,entity_id,action,before_json,after_json,actor,created_at) VALUES ('property',?,'quality_reject',?,?,?,?)`).run(
+              String(propertyId), JSON.stringify(before), JSON.stringify({ ...before, deleted_at: now, quality_rejection_reasons: qualityReasons }), 'system:active-inventory-quality-v1', now,
+            )
+            continue
+          }
           attachPropertyToListingCluster(db, propertyId)
           groupPotentialDuplicates(db, propertyId)
         }
@@ -88,13 +99,28 @@ export function createPropertyRepository(db) {
         'p.deleted_at IS NULL',
         `p.transaction_type IN ('rent', 'sale', 'rent_and_sale', 'wanted_rent', 'wanted_buy')`,
       ]
+      if (options.ownerOnly === true || options.ownerOnly === '1') where.push("p.source_role = 'owner'")
+      if (options.rentOnly === true || options.rentOnly === '1') where.push("p.transaction_type IN ('rent','rent_and_sale')")
       const params = []
-      const filters = [
-        [`(p.project_name_canonical LIKE ? OR p.project_name_raw LIKE ? OR p.zone LIKE ? OR p.district LIKE ? OR p.province LIKE ? OR p.contact_phone LIKE ? OR r.raw_text LIKE ? OR EXISTS (
+      if (options.search) {
+        const search = String(options.search).trim()
+        const generalPattern = `%${search}%`
+        const stationTerm = search
+          .replace(/^\s*(?:BTS|MRT|ARL|Airport\s+Rail\s+Link)\s*[-–—:]?\s*/i, '')
+          .trim() || search
+        const stationPattern = `%${stationTerm}%`
+        where.push(`(p.project_name_canonical LIKE ? OR p.project_name_raw LIKE ? OR p.zone LIKE ? OR p.district LIKE ? OR p.province LIKE ? OR p.contact_phone LIKE ? OR r.raw_text LIKE ? OR EXISTS (
           SELECT 1 FROM property_transit_stations pts
           LEFT JOIN transit_stations ts ON ts.id=pts.station_id
-          WHERE pts.property_id=p.id AND (ts.canonical_name_th LIKE ? OR ts.canonical_name_en LIKE ?)
-        ))`, options.search ? `%${options.search}%` : null],
+          LEFT JOIN transit_station_aliases tsa ON tsa.station_id=ts.id AND tsa.active=1
+          WHERE pts.property_id=p.id AND (
+            ts.canonical_name_th LIKE ? OR ts.canonical_name_en LIKE ?
+            OR pts.original_mention LIKE ? OR tsa.alias LIKE ?
+          )
+        ))`)
+        params.push(...Array(7).fill(generalPattern), ...Array(4).fill(stationPattern))
+      }
+      const filters = [
         ['(p.project_name_canonical LIKE ? OR p.project_name_raw LIKE ?)', options.project ? `%${options.project}%` : null],
         ['(p.zone LIKE ? OR p.district LIKE ? OR p.province LIKE ?)', options.location ? `%${options.location}%` : null],
         ['p.transaction_type = ?', options.intent || null],
@@ -122,19 +148,38 @@ export function createPropertyRepository(db) {
       if (options.review === '1') where.push(`p.status = 'pending_review'`)
       if (options.system) { where.push('EXISTS (SELECT 1 FROM property_transit_stations pts JOIN transit_stations ts ON ts.id=pts.station_id JOIN transit_systems sys ON sys.id=ts.system_id WHERE pts.property_id=p.id AND pts.match_status=\'matched\' AND sys.code=?)'); params.push(String(options.system).toUpperCase()) }
       if (options.stationId) { where.push('EXISTS (SELECT 1 FROM property_transit_stations pts WHERE pts.property_id=p.id AND pts.match_status=\'matched\' AND pts.station_id=?)'); params.push(options.stationId) }
-      if (options.transit) { where.push('EXISTS (SELECT 1 FROM property_transit_stations pts LEFT JOIN transit_stations ts ON ts.id=pts.station_id WHERE pts.property_id=p.id AND (ts.canonical_name_th LIKE ? OR ts.canonical_name_en LIKE ? OR pts.original_mention LIKE ?))'); params.push(`%${options.transit}%`, `%${options.transit}%`, `%${options.transit}%`) }
+      if (options.transit) {
+        const transitTerm = String(options.transit).replace(/^\s*(?:BTS|MRT|ARL|Airport\s+Rail\s+Link)\s*[-–—:]?\s*/i, '').trim()
+        const pattern = `%${transitTerm || options.transit}%`
+        where.push(`EXISTS (
+          SELECT 1 FROM property_transit_stations pts
+          LEFT JOIN transit_stations ts ON ts.id=pts.station_id
+          LEFT JOIN transit_station_aliases tsa ON tsa.station_id=ts.id AND tsa.active=1
+          WHERE pts.property_id=p.id AND (ts.canonical_name_th LIKE ? OR ts.canonical_name_en LIKE ? OR pts.original_mention LIKE ? OR tsa.alias LIKE ?)
+        )`)
+        params.push(pattern, pattern, pattern, pattern)
+      }
       const sqlWhere = where.join(' AND ')
       const orderBy = {
         price_asc: 'p.rent_price_monthly IS NULL, p.rent_price_monthly ASC, p.updated_at DESC',
         price_desc: 'p.rent_price_monthly IS NULL, p.rent_price_monthly DESC, p.updated_at DESC',
         area_asc: 'p.area_sqm IS NULL, p.area_sqm ASC, p.updated_at DESC',
         area_desc: 'p.area_sqm IS NULL, p.area_sqm DESC, p.updated_at DESC',
-        newest: 'p.updated_at DESC',
-      }[options.sort] || 'p.updated_at DESC'
+        newest: "COALESCE(r.source_created_at,r.captured_at,r.collected_at,p.created_at) DESC, p.id DESC",
+      }[options.sort] || "COALESCE(r.source_created_at,r.captured_at,r.collected_at,p.created_at) DESC, p.id DESC"
       const total = db.prepare(`SELECT COUNT(*) count FROM properties p JOIN raw_posts r ON r.id=p.raw_post_id WHERE ${sqlWhere}`).get(...params).count
       const posts = db.prepare(`
         SELECT p.*, r.raw_text, r.source_url permalink,
+               COALESCE(r.source_created_at,r.captured_at,r.collected_at,p.created_at) source_posted_at,
                r.source_group_name "group", c.post_intent,
+               CASE WHEN p.project_id IS NOT NULL THEN COALESCE(
+                 (SELECT pa.alias FROM project_aliases pa WHERE pa.project_id=p.project_id AND pa.verified=1 AND pa.alias NOT GLOB '*[ก-๙]*' AND pa.alias GLOB '*[A-Za-z]*' ORDER BY pa.id LIMIT 1),
+                 CASE WHEN pr.canonical_name NOT GLOB '*[ก-๙]*' THEN pr.canonical_name END
+               ) END project_name_en,
+               CASE WHEN p.project_id IS NOT NULL THEN COALESCE(
+                 (SELECT pa.alias FROM project_aliases pa WHERE pa.project_id=p.project_id AND pa.verified=1 AND pa.alias GLOB '*[ก-๙]*' ORDER BY pa.id LIMIT 1),
+                 CASE WHEN pr.canonical_name GLOB '*[ก-๙]*' THEN pr.canonical_name END
+               ) END project_name_th,
                lc.id listing_cluster_id,lc.status inventory_status,lc.freshness_score,
                (SELECT json_group_array(json_object(
                  'id', pts.id, 'status', pts.match_status, 'stationId', pts.station_id,
@@ -164,6 +209,7 @@ export function createPropertyRepository(db) {
         FROM properties p
         JOIN raw_posts r ON r.id = p.raw_post_id
         JOIN post_classifications c ON c.processing_run_id = p.processing_run_id
+        LEFT JOIN projects pr ON pr.id=p.project_id
         LEFT JOIN listing_cluster_members lcm ON lcm.property_id=p.id
         LEFT JOIN listing_clusters lc ON lc.id=lcm.cluster_id
         WHERE ${sqlWhere}
@@ -221,6 +267,14 @@ export function createPropertyRepository(db) {
       return db.prepare('SELECT * FROM properties WHERE id = ?').get(before.id)
     },
   }
+}
+
+export function activeInventoryRejectionReasons(property = {}, sourceUrl = '') {
+  void sourceUrl
+  return [
+    Number(property.rent_price_monthly) > 0 && Number(property.rent_price_monthly) < 7000 && 'rent_price_below_7000',
+    Number(property.sale_price) > 0 && Number(property.sale_price) < 7000 && 'sale_price_below_7000',
+  ].filter(Boolean)
 }
 
 function retireUnreviewedProperties(db, rawPostId, now) {
