@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { importMarketingProperty } from '../../server/marketingPlanImport.js'
+import { importMarketingProperty, marketingPropertyStatus } from '../../server/marketingPlanImport.js'
 import { buildPlanPlacements, parseMarketingPlan } from '../../server/aiMarketingPlan.js'
 
 function setup() {
@@ -43,4 +43,24 @@ describe('NEED_IMPORT Apply flow', () => {
     deps.importPostSetFromUrl.mockResolvedValueOnce({ postset: { id: 'not-saved' } })
     expect(await importMarketingProperty('CD-128936', deps)).toMatchObject({ postSet: null, error: { code: 'POST_SET_VERIFY_FAILED' } })
   })
+})
+
+it('reuses stock without resolving or importing', async () => {
+  const deps = setup()
+  deps.listSets().push({ id: 'existing', name: 'CD-128936' })
+  expect((await importMarketingProperty('CD-128936', deps)).postSet.id).toBe('existing')
+  expect(deps.resolveJsaPropertyUrlByCd).not.toHaveBeenCalled()
+})
+it.each(['CD_NOT_FOUND', 'MULTIPLE_MATCH'])('reports %s without importing', async code => {
+  const deps = setup()
+  deps.resolveJsaPropertyUrlByCd.mockRejectedValueOnce(Object.assign(new Error(code), { code }))
+  expect((await importMarketingProperty('CD-128936', deps)).error.code).toBe(code)
+  expect(deps.importPostSetFromUrl).not.toHaveBeenCalled()
+})
+it.each([
+  [{ projectSpecific: true, resolvedProjectId: null }, 'PROJECT_UNRESOLVED'],
+  [{ matchingGroups: [] }, 'NO_MATCHING_GROUP'],
+  [{ placements: [] }, 'NO_MEMBER_ACCOUNT'],
+])('classifies downstream failure', (patch, status) => {
+  expect(marketingPropertyStatus({ postSet: { id: 'p' }, matchingGroups: [{}], placements: [{}], requested: 1, ...patch })).toBe(status)
 })

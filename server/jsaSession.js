@@ -343,19 +343,38 @@ export async function resolveJsaPropertyUrlByCd(cd) {
   const code = String(cd || '').trim().toUpperCase()
   if (!/^CD-\d{6}$/.test(code)) { const error = new Error('invalid CD'); error.code = 'INVALID_CD'; throw error }
   if (!fs.existsSync(SESSION_FILE)) { const error = new Error('JSA login required'); error.code = 'JSA_LOGIN_REQUIRED'; throw error }
-  const browser = await launchBrowser({ headless: true }); try {
-    const context = await browser.newContext({ storageState: SESSION_FILE, locale: 'th-TH' }); const page = await context.newPage()
-    await page.goto('https://www.jsa.co.th/admin/property', { waitUntil: 'domcontentloaded', timeout: 30_000 }); await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {})
-    const input = page.getByLabel(/รหัสทรัพย์สิน/i).first(); if (await input.count()) { await input.fill(code); await input.press('Enter') } else { const any = page.locator('input').first(); if (await any.count()) { await any.fill(code); await any.press('Enter').catch(() => {}) } }
-    await page.waitForTimeout(800)
-    const rows = await page.locator('tr').evaluateAll((nodes, wanted) => nodes.filter((node) => (node.innerText || '').toUpperCase().includes(wanted)).length, code)
-    const links = await page.locator('a[href*="/admin/property/view/"]').evaluateAll((nodes, wanted) => nodes.filter((node) => (node.closest('tr')?.innerText || node.innerText || '').toUpperCase().includes(wanted)).map((node) => node.href), code)
-    const unique = [...new Set(links)]
-    if (!unique.length) { const error = new Error(`ไม่มีลิงก์ดูทรัพย์สำหรับ ${code}`); error.code = rows ? 'VIEW_LINK_NOT_FOUND' : 'CD_NOT_FOUND'; throw error }
-    if (unique.length > 1) { const error = new Error(`multiple CD matches: ${code}`); error.code = 'MULTIPLE_MATCH'; throw error }
-    return unique[0]
+  const browser = await launchBrowser({ headless: true })
+  try {
+    const context = await browser.newContext({ storageState: SESSION_FILE, locale: 'th-TH' })
+    const page = await context.newPage()
+    const expired = async () => /login|sign-in/i.test(page.url()) || await page.locator('input[type="password"]').isVisible().catch(() => false)
+    await page.goto('https://www.jsa.co.th/admin/property', { waitUntil: 'domcontentloaded', timeout: 30000 })
+    if (await expired()) throw Object.assign(new Error('กรุณาเข้าสู่ระบบ JSA ใหม่'), { code: 'JSA_SESSION_EXPIRED' })
+    const pattern = /รหัสทรัพย์สิน|รหัสทรัพย์|property.?code|ref(?:erence)?/i
+    const candidates = page.getByLabel(pattern).or(page.getByPlaceholder(pattern)).or(page.locator('input[name*="ref" i], input[name*="property_code" i], input[name*="propertyCode" i], input[name="code" i]')).filter({ visible: true })
+    if (!await candidates.count()) throw Object.assign(new Error('ไม่พบช่องค้นหารหัสทรัพย์ใน JSA'), { code: 'SEARCH_INPUT_NOT_FOUND' })
+    const input = candidates.first()
+    await input.fill(code)
+    await input.dispatchEvent('input')
+    await input.dispatchEvent('change')
+    const search = page.getByRole('button', { name: /ค้นหา|search/i }).filter({ visible: true }).first()
+    if (await search.count()) await search.click()
+    else await input.press('Enter')
+    await page.waitForFunction((wanted) => {
+      if (/login|sign-in/i.test(location.href) || document.querySelector('input[type="password"]')) return true
+      const text = document.body.innerText
+      return [...document.querySelectorAll('tr')].some(row => (row.innerText.toUpperCase().match(/\bCD-\d{6}\b/g) || []).includes(wanted)) || /ไม่พบข้อมูล|ไม่พบรายการ|no matching records|no records found/i.test(text)
+    }, code, { timeout: 15000 })
+    if (await expired()) throw Object.assign(new Error('กรุณาเข้าสู่ระบบ JSA ใหม่'), { code: 'JSA_SESSION_EXPIRED' })
+    const rows = await page.locator('tr').evaluateAll((nodes, wanted) => nodes.filter(node => (node.innerText.toUpperCase().match(/\bCD-\d{6}\b/g) || []).includes(wanted)).map(row => [...row.querySelectorAll('a[href]')].map(a => a.href).filter(url => new URL(url).pathname.startsWith('/admin/property/view/'))), code)
+    if (rows.length > 1) throw Object.assign(new Error(`พบหลายแถวสำหรับ ${code}`), { code: 'MULTIPLE_MATCH' })
+    if (!rows.length) throw Object.assign(new Error(`ไม่พบ ${code} ในผลค้นหา JSA`), { code: 'CD_NOT_FOUND' })
+    const links = [...new Set(rows[0])]
+    if (!links.length) throw Object.assign(new Error(`ไม่พบลิงก์ดูทรัพย์ ${code}`), { code: 'VIEW_LINK_NOT_FOUND' })
+    if (links.length > 1) throw Object.assign(new Error(`พบหลายลิงก์สำหรับ ${code}`), { code: 'MULTIPLE_MATCH' })
+    return links[0]
   } catch (error) {
-    if (error?.name === 'TimeoutError' || /timeout/i.test(error?.message || '')) error.code = 'TIMEOUT'
+    if (error?.name === 'TimeoutError') error.code = 'TIMEOUT'
     throw error
   } finally { await browser.close() }
 }

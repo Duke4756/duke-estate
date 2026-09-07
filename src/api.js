@@ -596,3 +596,10 @@ export async function saveKeywordsApi(keywords) {
   if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`)
   return body // { keywords, merged }
 }
+
+export async function retryMarketingProperty(property) {
+  const response = await fetch('/api/marketing-plan/retry-property', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ property }) })
+  const body = await response.json()
+  if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`)
+  return body
+}

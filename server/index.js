@@ -1,4 +1,4 @@
-import { importMarketingProperty } from './marketingPlanImport.js'
+import { importMarketingProperty, marketingPropertyStatus } from './marketingPlanImport.js'
 import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
@@ -1256,7 +1256,13 @@ app.post('/api/marketing-plan/preview', (req, res) => {
   try { res.json({ plan: previewMarketingPlan(req.body?.plan, { sets: listSets(), groups: loadGroupsFull() }) }) }
   catch (error) { res.status(400).json({ error: error.message }) }
 })
-app.post('/api/marketing-plan/apply', async (req, res) => {
+app.post('/api/marketing-plan/retry-property', (req, _res, next) => {
+  req.body = { plan: { version: 1, properties: [req.body?.property] } }
+  req.marketingRetry = true
+  next()
+}, applyMarketingPlanHandler)
+app.post('/api/marketing-plan/apply', applyMarketingPlanHandler)
+async function applyMarketingPlanHandler(req, res) {
   try {
     const parsed = parseMarketingPlan(req.body?.plan)
     const groups = loadGroupsFull()
@@ -1274,22 +1280,23 @@ app.post('/api/marketing-plan/apply', async (req, res) => {
       const importError = importDetails.error?.code || null
       const resolvedProjectId = resolveProjectId(item, projects, postSet ? `${postSet.name}\n${postSet.text}` : '')
       const base = { ...item, projectId: resolvedProjectId, postSetId: postSet?.id || null }
-      const placementResult = postSet && !(item.projectSpecific && !resolvedProjectId) ? buildPlanPlacements(base, groups, accountIds, memberships) : { groups: [], placements: [], rounds: [] }
-      const status = !postSet ? 'IMPORT_FAILED' : (item.projectSpecific && !resolvedProjectId ? 'PROJECT_UNRESOLVED' : placementResult.groups.length === 0 ? 'NO_MATCHING_GROUP' : placementResult.placements.length < item.placements ? 'NO_MEMBER_ACCOUNT' : 'READY')
+      const placementResult = postSet && !(item.projectSpecific && !resolvedProjectId) ? buildPlanPlacements(base, groups.filter(group => group.enabled !== false && group.active !== false && (!item.groupTags.length || (group.marketingTags || []).some(tag => item.groupTags.includes(String(tag).toUpperCase())) || (resolvedProjectId && (group.projectIds || []).map(String).includes(String(resolvedProjectId))))), accountIds, memberships) : { groups: [], placements: [], rounds: [] }
+      const matchingGroups = groups.filter(group => group.enabled !== false && group.active !== false && (!item.groupTags.length || (group.marketingTags || []).some(tag => item.groupTags.includes(String(tag).toUpperCase())) || (resolvedProjectId && (group.projectIds || []).map(String).includes(String(resolvedProjectId)))))
+      const status = marketingPropertyStatus({ postSet, projectSpecific: item.projectSpecific, resolvedProjectId, matchingGroups, placements: placementResult.placements, requested: item.placements })
       for (const placement of placementResult.placements) slotsByAccount[placement.accountId]?.push({ postSetId: postSet.id, group: placement.group, time: placement.preferredTimeWindow?.start || '09:00', round: placement.round })
       resolvedProperties.push({ ...item, ...importDetails, placementsCreated: placementResult.placements.length, resolvedProjectId, postSetId: postSet?.id || null, importStatus, importError, resolvedGroups: placementResult.groups.slice(0, item.placements), eligibleAccounts: [...new Set(placementResult.placements.map((p) => p.accountId))], placements: placementResult.placements, rounds: placementResult.rounds, status })
     }
     const usedAccounts = accountIds.filter((id) => slotsByAccount[id]?.length)
     const startDate = new Date(Date.now() + 7 * 3600000).toISOString().slice(0, 10)
     const accountRules = Object.fromEntries(usedAccounts.map((id) => [id, { startDate, repeatDaily: true, slots: slotsByAccount[id] }]))
-    const campaign = usedAccounts.length ? saveAutoCampaign({ mode: 'account_schedule', enabled: false, accountIds: usedAccounts, accountRules, postSetIds: [], groups: [], groupMode: 'selected', postSetMode: 'all', intervalMinutes: 30, priorityNewHours: 72 }) : null
+    const campaign = !req.marketingRetry && usedAccounts.length ? saveAutoCampaign({ mode: 'account_schedule', enabled: false, accountIds: usedAccounts, accountRules, postSetIds: [], groups: [], groupMode: 'selected', postSetMode: 'all', intervalMinutes: 30, priorityNewHours: 72 }) : null
     const planFile = path.join(process.cwd(), 'server', 'autopost', 'ai-marketing-plans.json')
     let history = []; try { history = JSON.parse(fs.readFileSync(planFile, 'utf8')) } catch {}
     const result = { ...parsed, importedAt: new Date().toISOString(), campaignId: campaign ? `ai_${Date.now()}` : null, properties: resolvedProperties }
     fs.mkdirSync(path.dirname(planFile), { recursive: true }); fs.writeFileSync(planFile, JSON.stringify([...history, result], null, 2))
     res.json({ campaign, plan: result, summary: { properties: resolvedProperties.length, ready: resolvedProperties.filter((p) => p.status === 'READY').length, failed: resolvedProperties.filter((p) => p.status !== 'READY').length, totalPlacements: resolvedProperties.reduce((n, p) => n + p.placements.length, 0) } })
   } catch (error) { res.status(400).json({ error: error.message }) }
-})
+}
 app.get('/api/marketing-plan/export', (_req, res) => { const file = path.join(process.cwd(), 'server', 'autopost', 'ai-marketing-plans.json'); try { res.json({ plans: JSON.parse(fs.readFileSync(file, 'utf8')) }) } catch { res.json({ plans: [] }) } })
 
 app.get('/api/postsets/jsa-session', (_req, res) => res.json(jsaSessionStatus()))
