@@ -350,14 +350,55 @@ export async function resolveJsaPropertyUrlByCd(cd) {
     const expired = async () => /login|sign-in/i.test(page.url()) || await page.locator('input[type="password"]').isVisible().catch(() => false)
     await page.goto('https://www.jsa.co.th/admin/property', { waitUntil: 'domcontentloaded', timeout: 30000 })
     if (await expired()) throw Object.assign(new Error('กรุณาเข้าสู่ระบบ JSA ใหม่'), { code: 'JSA_SESSION_EXPIRED' })
-    const pattern = /รหัสทรัพย์สิน|รหัสทรัพย์|property.?code|ref(?:erence)?/i
-    const candidates = page.getByLabel(pattern).or(page.getByPlaceholder(pattern)).or(page.locator('input[name*="ref" i], input[name*="property_code" i], input[name*="propertyCode" i], input[name="code" i]')).filter({ visible: true })
-    if (!await candidates.count()) throw Object.assign(new Error('ไม่พบช่องค้นหารหัสทรัพย์ใน JSA'), { code: 'SEARCH_INPUT_NOT_FOUND' })
-    const input = candidates.first()
+    // Like listJsaPropertyCandidates, wait for the React DOM, not networkidle.
+    // Return only an unambiguous, editable code/search field; never guess the
+    // first text input (JSA also has property-name, phone and price filters).
+    let input
+    try {
+      const handle = await page.waitForFunction(() => {
+        const visible = (node) => node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden'
+        const fields = [...document.querySelectorAll('input')].filter((node) =>
+          visible(node) && !node.disabled && !node.readOnly && /^(text|search)$/.test(node.type))
+        const codePattern = /รหัสทรัพย์(?:สิน)?|property[\s_-]*code|(?:^|[\s_-])ref(?:erence)?(?:$|[\s_-])|^code$/i
+        const ranked = fields.map((node) => {
+          const metadata = [node.name, node.id, node.placeholder, node.getAttribute('aria-label')]
+          const labels = [...(node.labels || [])].map((label) => label.innerText)
+          for (const id of (node.getAttribute('aria-labelledby') || '').split(/\s+/)) {
+            labels.push(document.getElementById(id)?.innerText || '')
+          }
+          let score = metadata.some((text) => codePattern.test(text || '')) ? 3 : labels.some((text) => codePattern.test(text)) ? 2 : 0
+          // Unassociated labels commonly sit beside an input wrapper.
+          for (let scope = node.parentElement, depth = 0; !score && scope && depth < 3; scope = scope.parentElement, depth += 1) {
+            if (fields.filter((field) => scope.contains(field)).length !== 1) break
+            if (codePattern.test(scope.innerText)) score = 1
+          }
+          // A generic search box is safe only if it is the sole searchable
+          // field in its form and the form explicitly mentions property codes.
+          const form = node.closest('form, [role="search"]')
+          if (!score && form && /ค้นหา|search/i.test(metadata.join(' ')) && codePattern.test(form.innerText)
+            && fields.filter((field) => form.contains(field)).length === 1) score = 1
+          return { node, score }
+        }).filter((item) => item.score).sort((a, b) => b.score - a.score)
+        return ranked.length && (!ranked[1] || ranked[0].score > ranked[1].score) ? ranked[0].node : false
+      }, undefined, { timeout: 15000 })
+      input = handle.asElement()
+    } catch (error) {
+      if (error.name !== 'TimeoutError') throw error
+      if (await expired()) throw Object.assign(new Error('กรุณาเข้าสู่ระบบ JSA ใหม่'), { code: 'JSA_SESSION_EXPIRED' })
+      console.warn('[JSA CD resolver] search input not found', await page.evaluate(() => {
+        const visible = (node) => node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden'
+        return {
+          url: location.origin + location.pathname,
+          inputs: [...document.querySelectorAll('input')].filter(visible).map(({ name, id, placeholder, type }) => ({ name, id, placeholder, type })),
+          buttons: [...document.querySelectorAll('button, [role="button"], input[type="submit"]')].filter(visible).map((node) => node.innerText || node.value || ''),
+        }
+      }))
+      throw Object.assign(new Error('ไม่พบช่องค้นหารหัสทรัพย์ใน JSA'), { code: 'SEARCH_INPUT_NOT_FOUND' })
+    }
     await input.fill(code)
     await input.dispatchEvent('input')
     await input.dispatchEvent('change')
-    const search = page.getByRole('button', { name: /ค้นหา|search/i }).filter({ visible: true }).first()
+    const search = page.getByRole('button', { name: /^(?:ค้นหา|search)$/i }).filter({ visible: true }).first()
     if (await search.count()) await search.click()
     else await input.press('Enter')
     await page.waitForFunction((wanted) => {
@@ -366,7 +407,7 @@ export async function resolveJsaPropertyUrlByCd(cd) {
       return [...document.querySelectorAll('tr')].some(row => (row.innerText.toUpperCase().match(/\bCD-\d{6}\b/g) || []).includes(wanted)) || /ไม่พบข้อมูล|ไม่พบรายการ|no matching records|no records found/i.test(text)
     }, code, { timeout: 15000 })
     if (await expired()) throw Object.assign(new Error('กรุณาเข้าสู่ระบบ JSA ใหม่'), { code: 'JSA_SESSION_EXPIRED' })
-    const rows = await page.locator('tr').evaluateAll((nodes, wanted) => nodes.filter(node => (node.innerText.toUpperCase().match(/\bCD-\d{6}\b/g) || []).includes(wanted)).map(row => [...row.querySelectorAll('a[href]')].map(a => a.href).filter(url => new URL(url).pathname.startsWith('/admin/property/view/'))), code)
+    const rows = await page.locator('tr').evaluateAll((nodes, wanted) => nodes.filter(node => (node.innerText.toUpperCase().match(/\bCD-\d{6}\b/g) || []).includes(wanted)).map(row => [...row.querySelectorAll('a[href]')].map(a => a.href).filter(url => { const parsed = new URL(url); return parsed.protocol === 'https:' && /(^|\.)jsa\.co\.th$/i.test(parsed.hostname) && /^\/admin\/property\/view\/\d+\/?$/.test(parsed.pathname) })), code)
     if (rows.length > 1) throw Object.assign(new Error(`พบหลายแถวสำหรับ ${code}`), { code: 'MULTIPLE_MATCH' })
     if (!rows.length) throw Object.assign(new Error(`ไม่พบ ${code} ในผลค้นหา JSA`), { code: 'CD_NOT_FOUND' })
     const links = [...new Set(rows[0])]
