@@ -7,6 +7,7 @@ const apiPort = Number(process.env.VITE_API_PORT) || 8787
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
+    watch: { ignored: ['**/server/autopost/**'] },
     port: 5173,
     proxy: {
       // Forward API calls to the Express backend

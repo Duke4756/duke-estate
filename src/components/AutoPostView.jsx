@@ -110,6 +110,8 @@ function PostSetsPanel() {
   const [importProgress, setImportProgress] = useState('')
   const [planJson, setPlanJson] = useState('')
   const [planPreview, setPlanPreview] = useState(null)
+  const [applyResult, setApplyResult] = useState(null)
+  const [applyingPlan, setApplyingPlan] = useState(false)
   const [category, setCategory] = useState('all')
 
   function refresh() {
@@ -128,7 +130,20 @@ function PostSetsPanel() {
   async function previewPlan() {
     try { setPlanPreview(await previewMarketingPlan(planJson)) } catch (e) { setError(e.message) }
   }
-  async function applyPlan() { try { await applyMarketingPlan(planJson); setImportedName('นำเข้าแผนและสร้างการตั้งค่าแล้ว') } catch (e) { setError(e.message) } }
+  async function applyPlan() {
+    if (applyingPlan) return
+    setApplyingPlan(true)
+    setError(null)
+    try {
+      const result = await applyMarketingPlan(planJson)
+      setApplyResult(result)
+      const stock = await getPostSets()
+      setSets(stock.postsets || [])
+      if (result.summary.failed) setError(`Apply มีรายการไม่สำเร็จ ${result.summary.failed} รายการ ดูรายละเอียดราย CD ด้านล่าง`)
+      else setImportedName(`Apply สำเร็จ ${result.summary.ready} รายการ`)
+    } catch (e) { setError(e.message) }
+    finally { setApplyingPlan(false) }
+  }
 
   function queueImport(value = quickUrl) {
     const urls = [...new Set(String(value || '').match(/https?:\/\/[^\s,]+/gi) || [])]
@@ -213,7 +228,10 @@ function PostSetsPanel() {
 
   return (
     <div className="space-y-4">
-      <div className="rounded-2xl border border-violet-200 bg-violet-50 p-4"><h3 className="text-sm font-bold text-violet-900">🤖 AI Marketing Plan</h3><p className="mt-1 text-xs text-violet-700">เลือกไฟล์ JSON หรือวางข้อมูลแผนการตลาดเพื่อ preview ก่อนใช้</p><input type="file" accept="application/json,.json" onChange={(e) => { const file = e.target.files?.[0]; if (file) file.text().then(setPlanJson) }} className="mt-2 block w-full text-xs" /><textarea value={planJson} onChange={(e) => setPlanJson(e.target.value)} rows={3} placeholder="{ &quot;version&quot;: 1, &quot;campaign&quot;: &quot;PM-W37&quot;, &quot;properties&quot;: [] }" className="mt-2 w-full rounded-xl border border-violet-200 bg-white p-2 text-xs" /><button type="button" onClick={previewPlan} disabled={!planJson.trim()} className="mt-2 rounded-lg bg-violet-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-40">Preview</button>{planPreview && <button type="button" onClick={applyPlan} className="ml-2 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white">Apply Plan</button>}{planPreview && <div className="mt-3 space-y-1 text-xs text-violet-900">{planPreview.properties.map((item) => <div key={item.cd} className="rounded-lg bg-white p-2"><b>{item.cd}</b> · {item.status} · Tags: {item.groupTags.join(', ') || '-'} · กลุ่มที่พบ {item.resolvedGroups.length}/{item.placements}</div>)}</div>}</div>
+      <div className="rounded-2xl border border-violet-200 bg-violet-50 p-4"><h3 className="text-sm font-bold text-violet-900">🤖 AI Marketing Plan</h3><p className="mt-1 text-xs text-violet-700">เลือกไฟล์ JSON หรือวางข้อมูลแผนการตลาดเพื่อ preview ก่อนใช้</p><input type="file" accept="application/json,.json" onChange={(e) => { const file = e.target.files?.[0]; if (file) file.text().then(setPlanJson) }} className="mt-2 block w-full text-xs" /><textarea value={planJson} onChange={(e) => setPlanJson(e.target.value)} rows={3} placeholder="{ &quot;version&quot;: 1, &quot;campaign&quot;: &quot;PM-W37&quot;, &quot;properties&quot;: [] }" className="mt-2 w-full rounded-xl border border-violet-200 bg-white p-2 text-xs" /><button type="button" onClick={previewPlan} disabled={!planJson.trim()} className="mt-2 rounded-lg bg-violet-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-40">Preview</button>{planPreview && <button type="button" onClick={applyPlan} disabled={applyingPlan} className="ml-2 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white">Apply Plan</button>}{planPreview && <div className="mt-3 space-y-1 text-xs text-violet-900">{planPreview.properties.map((item) => <div key={item.cd} className="rounded-lg bg-white p-2"><b>{item.cd}</b> · {item.status} · Tags: {item.groupTags.join(', ') || '-'} · กลุ่มที่พบ {item.resolvedGroups.length}/{item.placements}</div>)}</div>}</div>
+      {applyingPlan && <p role="status">กำลัง resolve และนำเข้าทรัพย์… กรุณารอผล Apply</p>}
+      {applyResult && <section aria-label="Apply result" className="space-y-2">{applyResult.plan.properties.map((item) => <div key={item.cd} className="rounded-xl border bg-white p-3 text-xs"><b>{item.cd} · {item.status}</b><p>resolve: {item.resolve} · import: {item.import}</p><p className="break-all">jsaUrl: {item.jsaUrl || '-'}</p><p>postSetId: {item.postSetId || '-'} · project: {item.resolvedProjectId || '-'} · placementsCreated: {item.placementsCreated}</p>{item.error && <p role="alert" className="text-rose-700">{item.error.code}: {item.error.message}</p>}</div>)}</section>}
+
       <div className="rounded-2xl border border-indigo-200 bg-gradient-to-r from-indigo-50 to-white p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div><h3 className="text-sm font-bold text-indigo-900">เพิ่มทรัพย์ด้วยตนเองจากลิงก์ JSA</h3><p className="mt-0.5 text-xs text-indigo-600">วางลิงก์เพื่อดึงรายละเอียดและรูป แล้วตรวจสอบก่อนบันทึกเข้าสต็อกด้วยตนเอง</p></div>

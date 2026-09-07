@@ -1,3 +1,4 @@
+import { importMarketingProperty } from './marketingPlanImport.js'
 import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
@@ -1265,28 +1266,18 @@ app.post('/api/marketing-plan/apply', async (req, res) => {
     const resolvedProperties = []
     const slotsByAccount = Object.fromEntries(accountIds.map((id) => [id, []]))
     for (const item of parsed.properties) {
-      let postSet = listSets().find((set) => new RegExp(`(^|\\s)${item.cd}(?:\\s|$)`, 'i').test(`${set.name}\n${set.text}`))
-      let importStatus = postSet ? 'READY' : 'NEED_IMPORT'
-      let importError = null
-      if (!postSet) {
-        try {
-          const sourceUrl = await resolveJsaPropertyUrlByCd(item.cd)
-          const imported = await importJsaProperty(sourceUrl)
-          if (!String(imported.text || '').trim() && !(imported.images || []).length) throw Object.assign(new Error('ไม่พบข้อมูลทรัพย์จาก JSA'), { code: 'IMPORT_FAILED' })
-          postSet = createSet({ ...imported, sourceUrl })
-          includeAutoCampaignPostSet(postSet.id)
-          importStatus = 'READY'
-        } catch (error) {
-          importError = error?.code || 'IMPORT_FAILED'
-          importStatus = 'IMPORT_FAILED'
-        }
-      }
+      const importedResult = await importMarketingProperty(item.cd, {
+        listSets, resolveJsaPropertyUrlByCd, importPostSetFromUrl,
+      })
+      const { postSet, ...importDetails } = importedResult
+      const importStatus = postSet ? 'READY' : 'IMPORT_FAILED'
+      const importError = importDetails.error?.code || null
       const resolvedProjectId = resolveProjectId(item, projects, postSet ? `${postSet.name}\n${postSet.text}` : '')
       const base = { ...item, projectId: resolvedProjectId, postSetId: postSet?.id || null }
       const placementResult = postSet && !(item.projectSpecific && !resolvedProjectId) ? buildPlanPlacements(base, groups, accountIds, memberships) : { groups: [], placements: [], rounds: [] }
       const status = !postSet ? 'IMPORT_FAILED' : (item.projectSpecific && !resolvedProjectId ? 'PROJECT_UNRESOLVED' : placementResult.groups.length === 0 ? 'NO_MATCHING_GROUP' : placementResult.placements.length < item.placements ? 'NO_MEMBER_ACCOUNT' : 'READY')
       for (const placement of placementResult.placements) slotsByAccount[placement.accountId]?.push({ postSetId: postSet.id, group: placement.group, time: placement.preferredTimeWindow?.start || '09:00', round: placement.round })
-      resolvedProperties.push({ ...item, resolvedProjectId, postSetId: postSet?.id || null, importStatus, importError, resolvedGroups: placementResult.groups.slice(0, item.placements), eligibleAccounts: [...new Set(placementResult.placements.map((p) => p.accountId))], placements: placementResult.placements, rounds: placementResult.rounds, status })
+      resolvedProperties.push({ ...item, ...importDetails, placementsCreated: placementResult.placements.length, resolvedProjectId, postSetId: postSet?.id || null, importStatus, importError, resolvedGroups: placementResult.groups.slice(0, item.placements), eligibleAccounts: [...new Set(placementResult.placements.map((p) => p.accountId))], placements: placementResult.placements, rounds: placementResult.rounds, status })
     }
     const usedAccounts = accountIds.filter((id) => slotsByAccount[id]?.length)
     const startDate = new Date(Date.now() + 7 * 3600000).toISOString().slice(0, 10)
@@ -1327,20 +1318,24 @@ app.post('/api/postsets/import-preview', async (req, res) => {
   }
 })
 
-app.post('/api/postsets/import', async (req, res) => {
-  const sourceUrl = String(req.body?.url || '').trim()
-  const propertyType = req.body?.propertyType
-  const deal = req.body?.deal
-  if (!sourceUrl) return res.status(400).json({ error: 'กรุณาวางลิงก์ประกาศ' })
+async function importPostSetFromUrl(sourceUrl, { propertyType, deal } = {}) {
   const duplicate = findSetBySourceUrl(sourceUrl)
-  if (duplicate?.images?.length) return res.json({ postset: listSets().find((set) => set.id === duplicate.id), duplicate: true })
-  try {
+  if (duplicate?.images?.length) return { postset: listSets().find((set) => set.id === duplicate.id), duplicate: true }
     const isJsaAdmin = (() => { try { return /(^|\.)jsa\.co\.th$/i.test(new URL(sourceUrl).hostname) && /^\/admin\/property\/view\//i.test(new URL(sourceUrl).pathname) } catch { return false } })()
     const imported = isJsaAdmin ? await importJsaProperty(sourceUrl) : await importPropertyUrl(sourceUrl)
     if (!String(imported.text || '').trim() && !(imported.images || []).length) throw new Error('ไม่พบข้อความหรือรูปจากประกาศนี้')
     const postset = duplicate ? refreshImportedSet(duplicate.id, { ...imported, propertyType, deal }) : createSet({ ...imported, propertyType, deal })
     includeAutoCampaignPostSet(postset.id)
-    res.json({ postset })
+    return { postset }
+}
+
+app.post('/api/postsets/import', async (req, res) => {
+  const sourceUrl = String(req.body?.url || '').trim()
+  const propertyType = req.body?.propertyType
+  const deal = req.body?.deal
+  if (!sourceUrl) return res.status(400).json({ error: 'กรุณาวางลิงก์ประกาศ' })
+  try {
+    res.json(await importPostSetFromUrl(sourceUrl, { propertyType, deal }))
   } catch (error) {
     const message = error?.name === 'TimeoutError' ? 'เว็บไซต์ใช้เวลาตอบกลับนานเกินไป' : error.message
     res.status(400).json({ error: message || 'นำเข้าจากลิงก์ไม่สำเร็จ' })
