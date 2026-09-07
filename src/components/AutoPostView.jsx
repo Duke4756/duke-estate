@@ -16,6 +16,8 @@ import {
   reorderPostSets,
   previewMarketingPlan,
   applyMarketingPlan,
+  previewCampaignCsv,
+  applyCampaignCsv,
   retryMarketingProperty,
 } from '../api'
 import PostSetEditor from './PostSetEditor'
@@ -114,6 +116,9 @@ function PostSetsPanel() {
   const [applyResult, setApplyResult] = useState(null)
   const [applyingPlan, setApplyingPlan] = useState(false)
   const [category, setCategory] = useState('all')
+  const [campaignCsv, setCampaignCsv] = useState('')
+  const [campaignPreview, setCampaignPreview] = useState(null)
+  const [campaignResult, setCampaignResult] = useState(null)
 
   function refresh() {
     setLoading(true)
@@ -155,6 +160,9 @@ function PostSetsPanel() {
     } catch (e) { setError(e.message) }
     finally { setApplyingPlan(false) }
   }
+  async function previewCsv() { try { setError(null); setCampaignPreview(await previewCampaignCsv(campaignCsv)) } catch (e) { setError(e.message) } }
+  async function applyCsv() { if (!campaignCsv.trim() || applyingPlan) return; setApplyingPlan(true); setError(null); try { const result = await applyCampaignCsv(campaignCsv); setCampaignResult(result); setCampaignPreview(null); refresh() } catch (e) { setError(e.message) } finally { setApplyingPlan(false) } }
+  async function retryCsvCd(cd) { const lines = campaignCsv.split(/\r?\n/).filter(Boolean); if (lines.length < 2) return; const retry = [lines[0], ...lines.slice(1).filter((line) => line.split(',')[0].trim().toUpperCase() === cd) ].join('\n'); setCampaignCsv(retry); setCampaignResult(null); setCampaignPreview(null); }
 
   function queueImport(value = quickUrl) {
     const urls = [...new Set(String(value || '').match(/https?:\/\/[^\s,]+/gi) || [])]
@@ -239,6 +247,7 @@ function PostSetsPanel() {
 
   return (
     <div className="space-y-4">
+      <div className="rounded-2xl border border-sky-200 bg-sky-50 p-4"><h3 className="text-sm font-bold text-sky-900">Campaign CSV</h3><p className="mt-1 text-xs text-sky-700">cd,priority,group_tag,target_groups,rounds,time_start,time_end,language,hook</p><input type="file" accept=".csv,text/csv" onChange={(e) => { const file = e.target.files?.[0]; if (file) file.text().then(setCampaignCsv) }} className="mt-2 block w-full text-xs" /><textarea value={campaignCsv} onChange={(e) => setCampaignCsv(e.target.value)} rows={3} placeholder="cd,priority,group_tag,target_groups,rounds,time_start,time_end,language,hook" className="mt-2 w-full rounded-xl border border-sky-200 bg-white p-2 text-xs" /><button type="button" onClick={previewCsv} disabled={!campaignCsv.trim()} className="mt-2 rounded-lg bg-sky-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-40">Preview</button>{campaignPreview && <div className="mt-3 space-y-1 text-xs text-sky-900"><p>Rows {campaignPreview.summary.rows} · CDs {campaignPreview.summary.cds} · placements {campaignPreview.summary.placements} · ready {campaignPreview.summary.ready} · failed {campaignPreview.summary.failed}</p>{campaignPreview.properties.map((item) => <div key={item.cd} className="rounded-lg bg-white p-2"><b>{item.cd}</b> · {item.status} · groups {item.eligibleGroups} · accounts {item.eligibleAccounts.length} · placements {item.plannedPlacements}</div>)}<button type="button" onClick={applyCsv} disabled={applyingPlan} className="rounded-lg bg-emerald-600 px-3 py-2 font-bold text-white">Apply Campaign</button></div>}{campaignResult && <div className="mt-3 space-y-1 text-xs text-slate-800"><p>Apply: {campaignResult.summary?.cds} CDs · placements {campaignResult.summary?.placements}</p>{campaignResult.results?.map((item) => <div key={item.cd} className="rounded-lg bg-white p-2"><b>{item.cd}</b> · {item.status}</div>)}</div>}</div>
       <div className="rounded-2xl border border-violet-200 bg-violet-50 p-4"><h3 className="text-sm font-bold text-violet-900">🤖 AI Marketing Plan</h3><p className="mt-1 text-xs text-violet-700">เลือกไฟล์ JSON หรือวางข้อมูลแผนการตลาดเพื่อ preview ก่อนใช้</p><input type="file" accept="application/json,.json" onChange={(e) => { const file = e.target.files?.[0]; if (file) file.text().then(setPlanJson) }} className="mt-2 block w-full text-xs" /><textarea value={planJson} onChange={(e) => setPlanJson(e.target.value)} rows={3} placeholder="{ &quot;version&quot;: 1, &quot;campaign&quot;: &quot;PM-W37&quot;, &quot;properties&quot;: [] }" className="mt-2 w-full rounded-xl border border-violet-200 bg-white p-2 text-xs" /><button type="button" onClick={previewPlan} disabled={!planJson.trim()} className="mt-2 rounded-lg bg-violet-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-40">Preview</button>{planPreview && <button type="button" onClick={applyPlan} disabled={applyingPlan} className="ml-2 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white">Apply Plan</button>}{planPreview && <div className="mt-3 space-y-1 text-xs text-violet-900">{planPreview.properties.map((item) => <div key={item.cd} className="rounded-lg bg-white p-2"><b>{item.cd}</b> · {item.status} · Tags: {item.groupTags.join(', ') || '-'} · กลุ่มที่พบ {item.resolvedGroups.length}/{item.placements}</div>)}</div>}</div>
       {applyingPlan && <p role="status">กำลัง resolve และนำเข้าทรัพย์… กรุณารอผล Apply</p>}
       {applyResult && <section aria-label="Apply result" className="space-y-2">{applyResult.plan.properties.map((item) => <div key={item.cd} className={`rounded-xl border p-3 text-xs ${item.status === 'READY' ? 'bg-emerald-50 text-emerald-800' : item.status === 'IMPORT_FAILED' ? 'bg-rose-50 text-rose-800' : item.status === 'PROJECT_UNRESOLVED' ? 'bg-orange-50 text-orange-800' : 'bg-amber-50 text-amber-800'}`}><b>{item.cd} · {item.status}</b><p>resolve: {item.resolve} · import: {item.import}</p><p className="break-all">jsaUrl: {item.jsaUrl || '-'}</p><p>postSetId: {item.postSetId || '-'} · project: {item.resolvedProjectId || '-'} · placementsCreated: {item.placementsCreated}</p>{item.jsaUrl && <a href={item.jsaUrl} target="_blank" rel="noreferrer" className="mr-3 underline">เปิด JSA</a>}{item.status !== 'READY' && <button type="button" disabled={applyingPlan} onClick={() => retryProperty(item)} className="underline">Retry เฉพาะรายการนี้</button>}{item.error && <p role="alert" className="text-rose-700">{item.error.code}: {item.error.message}</p>}</div>)}</section>}

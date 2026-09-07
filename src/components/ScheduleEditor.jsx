@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { hasGroup } from '../groupUrl'
-import { createSchedule, createScheduleBatch, getAccounts, getGroups, saveGroups, updateSchedule } from '../api'
+import { createSchedule, createScheduleBatch, getAccounts, getGroups, resolveGroupNames, saveGroups, updateSchedule } from '../api'
 import { GROUP_SETS, groupSetLabel, selectGroupSet } from '../groupSets'
 
 const labelOf = (u) => (u.match(/groups\/([^/?]+)/) || [])[1] || u
@@ -29,9 +29,11 @@ export default function ScheduleEditor({ open, schedule, postSets, onClose, onSa
   const [error, setError] = useState(null)
   const [postSetQuery, setPostSetQuery] = useState('')
   const [groupQuery, setGroupQuery] = useState('')
+  const [groupCategory, setGroupCategory] = useState('all')
   const [showSelectedGroupsOnly, setShowSelectedGroupsOnly] = useState(false)
   const [editingGroupUrl, setEditingGroupUrl] = useState(null)
   const [librarySaving, setLibrarySaving] = useState(false)
+  const [resolvingNames, setResolvingNames] = useState(false)
   const [accounts, setAccounts] = useState([])
   const [accountId, setAccountId] = useState('primary')
   const dragSelection = useRef({ active: false, select: true, visited: new Set() })
@@ -49,6 +51,7 @@ export default function ScheduleEditor({ open, schedule, postSets, onClose, onSa
   const visibleSavedGroups = useMemo(() => {
     const query = groupQuery.trim().toLowerCase()
     return savedGroups.filter((group) => {
+      if (groupCategory !== 'all' && group.category !== groupCategory) return false
       if (showSelectedGroupsOnly && !groups.includes(group.url)) return false
       if (!query) return true
       return [group.name, group.label, labelOf(group.url), group.url, group.category]
@@ -56,7 +59,7 @@ export default function ScheduleEditor({ open, schedule, postSets, onClose, onSa
         .toLowerCase()
         .includes(query)
     })
-  }, [savedGroups, groups, groupQuery, showSelectedGroupsOnly])
+  }, [savedGroups, groups, groupQuery, groupCategory, showSelectedGroupsOnly])
 
   useEffect(() => {
     if (!open) return
@@ -71,6 +74,7 @@ export default function ScheduleEditor({ open, schedule, postSets, onClose, onSa
     setJitterMinutes(5)
     setPostSetQuery('')
     setGroupQuery('')
+    setGroupCategory('all')
     setShowSelectedGroupsOnly(false)
     setEditingGroupUrl(null)
     setAccountId(schedule?.accountId || 'primary')
@@ -218,6 +222,15 @@ export default function ScheduleEditor({ open, schedule, postSets, onClose, onSa
     } catch (e) {
       setError(e.message)
     }
+  }
+
+  async function refreshGroupNames() {
+    if (!savedGroups.length || resolvingNames) return
+    setResolvingNames(true)
+    try {
+      const result = await resolveGroupNames(savedGroups.map((group) => group.url))
+      setSavedGroups(result.groups || savedGroups)
+    } catch (e) { setError(e.message) } finally { setResolvingNames(false) }
   }
 
   async function updateLibraryGroup(url, patch) {
@@ -384,7 +397,7 @@ export default function ScheduleEditor({ open, schedule, postSets, onClose, onSa
                 <h3 className="text-sm font-bold text-slate-800">เลือกกลุ่มปลายทาง</h3>
                 <p className="mt-0.5 text-xs text-slate-400">กดค้างแล้วลากผ่านหลายกลุ่มเพื่อเลือกหรือเอาออก</p>
               </div>
-              <span className="shrink-0 rounded-full bg-indigo-100 px-3 py-1 text-xs font-bold text-indigo-700">เลือกแล้ว {groups.length} กลุ่ม</span>
+              <div className="flex items-center gap-2"><button type="button" onClick={refreshGroupNames} disabled={resolvingNames || !savedGroups.length} className="rounded-lg border border-indigo-200 bg-white px-2.5 py-1.5 text-[11px] font-bold text-indigo-700 disabled:opacity-40">{resolvingNames ? 'กำลังดึงชื่อ…' : '↻ อัปเดตชื่อกลุ่ม'}</button><span className="shrink-0 rounded-full bg-indigo-100 px-3 py-1 text-xs font-bold text-indigo-700">เลือกแล้ว {groups.length} กลุ่ม</span></div>
             </div>
             <div className="mt-3 grid gap-2 sm:grid-cols-[minmax(220px,1fr)_auto_auto]">
               <label className="relative">
@@ -395,6 +408,13 @@ export default function ScheduleEditor({ open, schedule, postSets, onClose, onSa
               <button type="button" onClick={toggleVisibleGroups} className="rounded-xl border border-indigo-200 bg-white px-3 py-2 text-xs font-semibold text-indigo-600 hover:bg-indigo-50">
                 {visibleSavedGroups.length > 0 && visibleSavedGroups.every((group) => groups.includes(group.url)) ? 'ล้างที่แสดง' : 'เลือกที่แสดง'}
               </button>
+            </div>
+            <div className="mt-3 flex flex-wrap gap-1.5" role="tablist" aria-label="หมวดหมู่กลุ่ม">
+              <button type="button" onClick={() => setGroupCategory('all')} className={`rounded-full px-3 py-1.5 text-xs font-bold ${groupCategory === 'all' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-600 border border-slate-200'}`}>ทุกหมวด · {savedGroups.length}</button>
+              {GROUP_SETS.map((set) => {
+                const count = savedGroups.filter((group) => group.category === set.id).length
+                return <button key={set.id} type="button" onClick={() => setGroupCategory(set.id)} className={`rounded-full px-3 py-1.5 text-xs font-bold ${groupCategory === set.id ? 'bg-indigo-600 text-white' : 'bg-white text-slate-600 border border-slate-200'}`}>{set.label} · {count}</button>
+              })}
             </div>
             <div className="mt-2 flex items-center justify-between rounded-xl bg-indigo-50 px-3 py-2 text-xs text-indigo-700">
               <span>🖱️ ลากเพื่อเลือกได้เหมือนชุดโพสต์</span>

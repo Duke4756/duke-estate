@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
+import { clearTimeout, setTimeout } from 'node:timers'
 import { fileURLToPath } from 'node:url'
 import { launchBrowser, LOW_RESOURCE_INTERACTIVE_ARGS, reduceInteractiveContextLoad } from './browserLauncher.js'
 import { detectGroupMembership, normalizeFacebookGroupUrl } from './groupMembership.js'

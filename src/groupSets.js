@@ -2,6 +2,7 @@ export const GROUP_SETS = [
   { id: 'general', label: 'ทั่วไป' },
   { id: 'pet', label: '🐾 เลี้ยงสัตว์ได้' },
   { id: 'owner', label: 'เจ้าของโดยตรง' },
+  { id: 'house', label: 'บ้าน' },
   { id: 'sale', label: 'ซื้อ / ขาย' },
   { id: 'custom', label: 'กำหนดเอง' },
 ]

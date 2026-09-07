@@ -6,13 +6,13 @@ export function validateAccountPlan(rule, { allowIncomplete = false } = {}) {
     : []
   const slots = Array.isArray(rule.slots) ? rule.slots : legacySlots
   if (!allowIncomplete && !slots.length) throw new Error('เพิ่มรายการโพสต์เฉพาะอย่างน้อย 1 รายการ')
-  if (slots.some((slot) => !slot.postSetId || !slot.group || !/^([01]\d|2[0-3]):[0-5]\d$/.test(slot.time || ''))) throw new Error('แต่ละรายการต้องมีทรัพย์ กลุ่ม และเวลาโพสต์')
+  if (slots.some((slot) => !slot.postSetId || !(Array.isArray(slot.groups) ? slot.groups : [slot.group]).every(Boolean) || !(Array.isArray(slot.times) ? slot.times : [slot.time]).every((time) => /^([01]\d|2[0-3]):[0-5]\d$/.test(time || '')))) throw new Error('แต่ละรายการต้องมีทรัพย์ กลุ่ม และเวลาโพสต์')
   if (!/^\d{4}-\d{2}-\d{2}$/.test(rule.startDate || '')) throw new Error('ระบุวันที่โพสต์ให้ครบทุกบัญชี')
   const firstTime = rule.time || slots[0]?.time || '09:00'
   const start = Date.parse(`${rule.startDate}T${firstTime}:00+07:00`)
   if (!Number.isFinite(start) || new Date(start + 7 * 3600000).toISOString().slice(0, 10) !== rule.startDate) throw new Error('วันที่โพสต์ไม่ถูกต้อง')
   if (!Array.isArray(rule.slots) && rule.intervalMinutes != null && (Number(rule.intervalMinutes) < 30 || Number(rule.intervalMinutes) > 1440 || Number(rule.intervalMinutes) * Math.max(0, slots.length - 1) > 1440)) throw new Error('ระยะห่างระหว่างโพสต์ต้องอยู่ระหว่าง 30–1,440 นาที')
-  const normalized = { slots: slots.map((slot) => ({ postSetId: String(slot.postSetId), group: String(slot.group), time: slot.time })), startDate: rule.startDate, time: firstTime, repeatDaily: rule.repeatDaily === true, intervalMinutes: Number(rule.intervalMinutes) || 30 }
+  const normalized = { slots: slots.flatMap((slot) => (slot.groups || [slot.group]).map((group) => ({ postSetId: String(slot.postSetId), group: String(group), time: (slot.times || [slot.time])[0], ...(slot.times ? { times: slot.times } : {}) }))), startDate: rule.startDate, time: firstTime, repeatDaily: rule.repeatDaily === true, intervalMinutes: Number(rule.intervalMinutes) || 30 }
   if (Array.isArray(rule.postSetIds)) Object.assign(normalized, { postSetIds: rule.postSetIds, groups: rule.groups || [] })
   return normalized
 }
@@ -38,7 +38,7 @@ export function nextAccountOccurrence(rule, lastOccurrence, now = Date.now()) {
 
 export function accountPlanEntries(rule, occurrence) {
   const slots = rule.slots || (rule.postSetIds || []).flatMap((postSetId, propertyIndex) => (rule.groups || []).map((group, groupIndex) => ({ postSetId, group, time: legacyTime(rule.time || '09:00', (propertyIndex * (rule.groups || []).length + groupIndex) * Number(rule.intervalMinutes || 30)) })))
-  return slots.map((slot) => {
+  return slots.flatMap((slot) => (slot.times || [slot.time]).map((time) => ({ ...slot, time }))).map((slot) => {
     const [hours, minutes] = slot.time.split(':').map(Number)
     const dayStart = new Date(occurrence)
     dayStart.setUTCHours(0, 0, 0, 0)

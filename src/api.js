@@ -55,6 +55,8 @@ export async function previewMarketingPlan(plan) {
   return body.plan
 }
 export async function applyMarketingPlan(plan) { const res = await fetch('/api/marketing-plan/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plan }) }); const body = await res.json().catch(() => ({})); if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`); return body }
+export async function previewCampaignCsv(csv) { const res = await fetch('/api/campaign-csv/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ csv }) }); const body = await res.json().catch(() => ({})); if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`); return body.preview }
+export async function applyCampaignCsv(csv) { const res = await fetch('/api/campaign-csv/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ csv }) }); const body = await res.json().catch(() => ({})); if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`); return body }
 export async function exportMarketingPlan() { const res = await fetch('/api/marketing-plan/export'); return res.json() }
 
 export async function importPostSetUrl(url) {
@@ -68,6 +70,7 @@ export async function importPostSetUrl(url) {
   return body.preview
 }
 
+/** @param {string} url @param {{ propertyType?: string, deal?: string }} options */
 export async function createPostSetFromUrl(url, { propertyType, deal } = {}) {
   const res = await fetch('/api/postsets/import', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url, propertyType, deal }),

@@ -58,6 +58,7 @@ import { refreshListingFreshness } from './db/repositories/listingClusters.js'
 import { pruneExtractionCache } from './db/repositories/cache.js'
 import { PIPELINE_VERSION } from './pipeline/versions.js'
 import { autopostReliability } from './autopostReliability.js'
+import { parseCampaignCsv, previewCampaignCsv, campaignId, readAppliedCampaigns, saveAppliedCampaign } from './campaignCsv.js'
 
 dotenv.config()
 
@@ -1255,6 +1256,38 @@ app.get('/api/postsets', (_req, res) => {
 app.post('/api/marketing-plan/preview', (req, res) => {
   try { res.json({ plan: previewMarketingPlan(req.body?.plan, { sets: listSets(), groups: loadGroupsFull() }) }) }
   catch (error) { res.status(400).json({ error: error.message }) }
+})
+app.post('/api/campaign-csv/preview', (req, res) => {
+  try { res.json({ preview: previewCampaignCsv(req.body?.csv) }) } catch (error) { res.status(400).json({ error: error.message }) }
+})
+app.post('/api/campaign-csv/apply', async (req, res) => {
+  try {
+    const parsed = parseCampaignCsv(req.body?.csv); if (parsed.errors.length) return res.status(400).json({ error: parsed.errors.join('; '), errors: parsed.errors })
+    const id = campaignId(parsed.rows); if (readAppliedCampaigns()[id]) return res.json({ status: 'ALREADY_APPLIED', campaignId: id, results: readAppliedCampaigns()[id].results })
+    const preview = previewCampaignCsv(parsed); const results = []; const accounts = listAccounts().filter((account) => account.ready); const balance = Object.fromEntries(accounts.map((a) => [a.id, 0]))
+    for (const item of preview.properties) {
+      let postSet = listSets().find((set) => `${set.name || ''}\n${set.text || ''}`.toUpperCase().includes(item.cd))
+      if (!postSet) {
+        const imported = await importMarketingProperty(item.cd, { listSets, resolveJsaPropertyUrlByCd, importPostSetFromUrl })
+        postSet = imported.postSet
+        if (!postSet) { results.push({ ...item, status: 'IMPORT_FAILED', error: imported.error }); continue }
+      }
+      const row = item.rows[0]; const postText = `${postSet.name || ''} ${postSet.text || ''}`.toLowerCase(); const groups = loadGroupsFull().filter((group) => group.active !== false && group.enabled !== false && (!row.group_tag || (group.marketingTags || []).includes(row.group_tag))).sort((a, b) => Number((b.projectTags || []).some((tag) => postText.includes(String(tag).toLowerCase()))) - Number((a.projectTags || []).some((tag) => postText.includes(String(tag).toLowerCase()))))
+      if (!groups.length) { results.push({ ...item, status: 'NO_MATCHING_GROUP', postSetId: postSet.id }); continue }
+      const placements = []
+      for (let round = 0; round < row.rounds; round += 1) { const used = new Set(); for (const group of groups) {
+        if (used.size >= row.target_groups) break
+        const eligible = accounts.filter((account) => groupMembershipFor(account.id, group.url) === 'MEMBER').sort((a, b) => balance[a.id] - balance[b.id])
+        if (!eligible.length) continue
+        const account = eligible[0]; placements.push({ group: group.url, accountId: account.id, round }); balance[account.id] += 1; used.add(group.url)
+      } }
+      if (!placements.length) { results.push({ ...item, status: accounts.length ? 'NO_MEMBER_ACCOUNT' : 'NO_MEMBER_ACCOUNT', postSetId: postSet.id }); continue }
+      const schedules = placements.map((placement) => createSchedule({ name: `CSV ${item.cd} · รอบ ${placement.round + 1}`, postSetId: postSet.id, groups: [placement.group], groupMode: 'selected', accountId: placement.accountId, runAt: new Date().toISOString() }))
+      results.push({ ...item, status: placements.length >= row.target_groups * row.rounds ? 'READY' : 'NO_MEMBER_ACCOUNT', postSetId: postSet.id, placements, scheduleIds: schedules.map((s) => s.id) })
+    }
+    const campaign = { campaignId: id, enabled: false, createdAt: new Date().toISOString(), results }; saveAppliedCampaign(id, campaign)
+    res.json({ campaignId: id, campaign, results, summary: { rows: parsed.rows.length, cds: results.length, placements: results.reduce((n, x) => n + (x.placements?.length || 0), 0), ready: results.filter((x) => x.status === 'READY').length, failed: results.filter((x) => x.status !== 'READY').length } })
+  } catch (error) { res.status(400).json({ error: error.message }) }
 })
 app.post('/api/marketing-plan/retry-property', (req, _res, next) => {
   req.body = { plan: { version: 1, properties: [req.body?.property] } }

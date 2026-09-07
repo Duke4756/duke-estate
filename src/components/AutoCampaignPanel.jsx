@@ -110,8 +110,9 @@ export default function AutoCampaignPanel({ onOpenAccounts = () => {}, showSetti
   }
 
   function configuredCampaign(current) {
-    return { ...current, mode: 'account_schedule', postSetIds: [], groups: [],
-      accountRules: Object.fromEntries(accounts.map(({ id }) => [id, defaultAccountPlan(current, id)])) }
+    const accountRules = { ...(current.accountRules || {}) }
+    for (const { id } of accounts) accountRules[id] = defaultAccountPlan(current, id)
+    return { ...current, mode: 'account_schedule', postSetIds: [], groups: [], accountRules }
   }
 
   async function submit(event) {
