@@ -111,7 +111,7 @@ export default function AutoCampaignPanel({ onOpenAccounts = () => {}, showSetti
 
   function configuredCampaign(current) {
     const accountRules = { ...(current.accountRules || {}) }
-    for (const { id } of accounts) accountRules[id] = defaultAccountPlan(current, id)
+    for (const { id } of accounts) if (!accountRules[id]) accountRules[id] = defaultAccountPlan(current, id)
     return { ...current, mode: 'account_schedule', postSetIds: [], groups: [], accountRules }
   }
 
