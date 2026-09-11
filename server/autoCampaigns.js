@@ -19,6 +19,8 @@ const DEFAULTS = {
   priorityNewHours: 72,
   accountState: {},
   rotationState: { cycle: 1, usedPostSetIds: [] },
+  accountGapMinutes: 65,
+  postingWindow: { start: '08:00', end: '22:00', daily: true },
 }
 
 export function randomizedCycleDelayMs(intervalMinutes = 30, random = Math.random) {
@@ -47,7 +49,8 @@ export function getAutoCampaign() {
       ...saved,
       accountState: saved.accountState || {},
       accountRules: saved.accountRules || {},
-      rotationState: { ...DEFAULTS.rotationState, ...(saved.rotationState || {}) },
+    rotationState: { ...DEFAULTS.rotationState, ...(saved.rotationState || {}) },
+      postingWindow: { ...DEFAULTS.postingWindow, ...(saved.postingWindow || {}) },
     }
   } catch {
     return { ...DEFAULTS }
@@ -124,6 +127,8 @@ export function saveAutoCampaign(input = {}) {
     burstSize: Math.max(1, Math.min(10, Number(input.burstSize) || previous.burstSize || 2)),
     accountRules,
     priorityNewHours,
+    accountGapMinutes: Math.max(61, Number(input.accountGapMinutes ?? previous.accountGapMinutes ?? 65)),
+    postingWindow: { ...previous.postingWindow, ...(input.postingWindow || {}) },
     updatedAt: new Date().toISOString(),
   }
   if (settings.enabled && !settings.accountIds.length) throw new Error('เลือกบัญชีอย่างน้อยหนึ่งบัญชี')
@@ -200,7 +205,7 @@ export function consumedAutoPostSetIds(schedules = []) {
   return [...new Set((schedules || [])
     .filter((schedule) => schedule.source === 'auto' && !active.has(schedule.postSetId))
     .filter((schedule) => (schedule.results || []).some((result) => result.ok === true
-      && ['permalink', 'group_card', 'facebook_api'].includes(result.verified)))
+      && ['permalink', 'facebook_api'].includes(result.verified)))
     .map((schedule) => schedule.postSetId).filter(Boolean))]
 }
 

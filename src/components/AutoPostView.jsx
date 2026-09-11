@@ -14,16 +14,12 @@ import {
   getJsaSession,
   startJsaSession,
   reorderPostSets,
-  previewMarketingPlan,
-  applyMarketingPlan,
-  previewCampaignCsv,
-  applyCampaignCsv,
-  retryMarketingProperty,
 } from '../api'
 import PostSetEditor from './PostSetEditor'
 import ScheduleEditor from './ScheduleEditor'
 import AccountsPanel from './AccountsPanel'
 import AutoCampaignPanel from './AutoCampaignPanel'
+import GroupsModal from './GroupsModal'
 import { filterAndSortSchedules, paginateSchedules } from './scheduleQueue'
 
 const labelOf = (u) => (u.match(/groups\/([^/?]+)/) || [])[1] || u
@@ -111,14 +107,21 @@ function PostSetsPanel() {
   const [selectedSetIds, setSelectedSetIds] = useState([])
   const [draggedSetId, setDraggedSetId] = useState(null)
   const [importProgress, setImportProgress] = useState('')
+  const [category, setCategory] = useState('all')
+  // Legacy import panels remain mounted only for backward-compatible state;
+  // the UI is intentionally hidden while Campaign is being replaced.
   const [planJson, setPlanJson] = useState('')
   const [planPreview, setPlanPreview] = useState(null)
   const [applyResult, setApplyResult] = useState(null)
   const [applyingPlan, setApplyingPlan] = useState(false)
-  const [category, setCategory] = useState('all')
   const [campaignCsv, setCampaignCsv] = useState('')
   const [campaignPreview, setCampaignPreview] = useState(null)
   const [campaignResult, setCampaignResult] = useState(null)
+  const previewPlan = () => {}
+  const applyPlan = () => {}
+  const retryProperty = () => {}
+  const previewCsv = () => {}
+  const applyCsv = () => {}
 
   function refresh() {
     setLoading(true)
@@ -133,36 +136,6 @@ function PostSetsPanel() {
     getJsaSession().then(setJsaSession).catch(() => {})
   }, [])
 
-  async function previewPlan() {
-    try { setPlanPreview(await previewMarketingPlan(planJson)) } catch (e) { setError(e.message) }
-  }
-  async function retryProperty(item) {
-    setApplyingPlan(true)
-    try {
-      const result = await retryMarketingProperty(item)
-      setApplyResult(current => ({ ...current, plan: { ...current.plan, properties: current.plan.properties.map(old => old.cd === item.cd ? result.plan.properties[0] : old) } }))
-      const stock = await getPostSets()
-      setSets(stock.postsets || [])
-    } catch (error) { setError(error.message) }
-    finally { setApplyingPlan(false) }
-  }
-  async function applyPlan() {
-    if (applyingPlan) return
-    setApplyingPlan(true)
-    setError(null)
-    try {
-      const result = await applyMarketingPlan(planJson)
-      setApplyResult(result)
-      const stock = await getPostSets()
-      setSets(stock.postsets || [])
-      if (result.summary.failed) setError(`Apply มีรายการไม่สำเร็จ ${result.summary.failed} รายการ ดูรายละเอียดราย CD ด้านล่าง`)
-      else setImportedName(`Apply สำเร็จ ${result.summary.ready} รายการ`)
-    } catch (e) { setError(e.message) }
-    finally { setApplyingPlan(false) }
-  }
-  async function previewCsv() { try { setError(null); setCampaignPreview(await previewCampaignCsv(campaignCsv)) } catch (e) { setError(e.message) } }
-  async function applyCsv() { if (!campaignCsv.trim() || applyingPlan) return; setApplyingPlan(true); setError(null); try { const result = await applyCampaignCsv(campaignCsv); setCampaignResult(result); setCampaignPreview(null); refresh() } catch (e) { setError(e.message) } finally { setApplyingPlan(false) } }
-  async function retryCsvCd(cd) { const lines = campaignCsv.split(/\r?\n/).filter(Boolean); if (lines.length < 2) return; const retry = [lines[0], ...lines.slice(1).filter((line) => line.split(',')[0].trim().toUpperCase() === cd) ].join('\n'); setCampaignCsv(retry); setCampaignResult(null); setCampaignPreview(null); }
 
   function queueImport(value = quickUrl) {
     const urls = [...new Set(String(value || '').match(/https?:\/\/[^\s,]+/gi) || [])]
@@ -246,7 +219,7 @@ function PostSetsPanel() {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 [&>div:nth-child(1)]:hidden [&>div:nth-child(2)]:hidden">
       <div className="rounded-2xl border border-sky-200 bg-sky-50 p-4"><h3 className="text-sm font-bold text-sky-900">Campaign CSV</h3><p className="mt-1 text-xs text-sky-700">cd,priority,group_tag,target_groups,rounds,time_start,time_end,language,hook</p><input type="file" accept=".csv,text/csv" onChange={(e) => { const file = e.target.files?.[0]; if (file) file.text().then(setCampaignCsv) }} className="mt-2 block w-full text-xs" /><textarea value={campaignCsv} onChange={(e) => setCampaignCsv(e.target.value)} rows={3} placeholder="cd,priority,group_tag,target_groups,rounds,time_start,time_end,language,hook" className="mt-2 w-full rounded-xl border border-sky-200 bg-white p-2 text-xs" /><button type="button" onClick={previewCsv} disabled={!campaignCsv.trim()} className="mt-2 rounded-lg bg-sky-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-40">Preview</button>{campaignPreview && <div className="mt-3 space-y-1 text-xs text-sky-900"><p>Rows {campaignPreview.summary.rows} · CDs {campaignPreview.summary.cds} · placements {campaignPreview.summary.placements} · ready {campaignPreview.summary.ready} · failed {campaignPreview.summary.failed}</p>{campaignPreview.properties.map((item) => <div key={item.cd} className="rounded-lg bg-white p-2"><b>{item.cd}</b> · {item.status} · groups {item.eligibleGroups} · accounts {item.eligibleAccounts.length} · placements {item.plannedPlacements}</div>)}<button type="button" onClick={applyCsv} disabled={applyingPlan} className="rounded-lg bg-emerald-600 px-3 py-2 font-bold text-white">Apply Campaign</button></div>}{campaignResult && <div className="mt-3 space-y-1 text-xs text-slate-800"><p>Apply: {campaignResult.summary?.cds} CDs · placements {campaignResult.summary?.placements}</p>{campaignResult.results?.map((item) => <div key={item.cd} className="rounded-lg bg-white p-2"><b>{item.cd}</b> · {item.status}</div>)}</div>}</div>
       <div className="rounded-2xl border border-violet-200 bg-violet-50 p-4"><h3 className="text-sm font-bold text-violet-900">🤖 AI Marketing Plan</h3><p className="mt-1 text-xs text-violet-700">เลือกไฟล์ JSON หรือวางข้อมูลแผนการตลาดเพื่อ preview ก่อนใช้</p><input type="file" accept="application/json,.json" onChange={(e) => { const file = e.target.files?.[0]; if (file) file.text().then(setPlanJson) }} className="mt-2 block w-full text-xs" /><textarea value={planJson} onChange={(e) => setPlanJson(e.target.value)} rows={3} placeholder="{ &quot;version&quot;: 1, &quot;campaign&quot;: &quot;PM-W37&quot;, &quot;properties&quot;: [] }" className="mt-2 w-full rounded-xl border border-violet-200 bg-white p-2 text-xs" /><button type="button" onClick={previewPlan} disabled={!planJson.trim()} className="mt-2 rounded-lg bg-violet-600 px-3 py-2 text-xs font-bold text-white disabled:opacity-40">Preview</button>{planPreview && <button type="button" onClick={applyPlan} disabled={applyingPlan} className="ml-2 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-bold text-white">Apply Plan</button>}{planPreview && <div className="mt-3 space-y-1 text-xs text-violet-900">{planPreview.properties.map((item) => <div key={item.cd} className="rounded-lg bg-white p-2"><b>{item.cd}</b> · {item.status} · Tags: {item.groupTags.join(', ') || '-'} · กลุ่มที่พบ {item.resolvedGroups.length}/{item.placements}</div>)}</div>}</div>
       {applyingPlan && <p role="status">กำลัง resolve และนำเข้าทรัพย์… กรุณารอผล Apply</p>}
@@ -777,7 +750,7 @@ const TABS = [
 
 function MarketingAutomationPanel({ onOpenAccounts }) {
   const [subtab, setSubtab] = useState('setting')
-  return <div className="space-y-5"><div className="flex w-fit rounded-xl bg-slate-200/70 p-1"><button type="button" onClick={() => setSubtab('monitor')} className={`rounded-lg px-4 py-2 text-sm font-bold ${subtab === 'monitor' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500'}`}>Monitor</button><button type="button" onClick={() => setSubtab('setting')} className={`rounded-lg px-4 py-2 text-sm font-bold ${subtab === 'setting' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500'}`}>Setting</button></div>{subtab === 'monitor' ? <AutoCampaignPanel onOpenAccounts={onOpenAccounts} showSettings={false} /> : <AutoCampaignPanel onOpenAccounts={onOpenAccounts} showSettings />}</div>
+  return <div className="space-y-5"><div className="flex w-fit rounded-xl bg-slate-200/70 p-1"><button type="button" onClick={() => setSubtab('monitor')} className={`rounded-lg px-4 py-2 text-sm font-bold ${subtab === 'monitor' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500'}`}>Monitor</button><button type="button" onClick={() => setSubtab('setting')} className={`rounded-lg px-4 py-2 text-sm font-bold ${subtab === 'setting' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500'}`}>Setting</button><button type="button" onClick={() => setSubtab('groups')} className={`rounded-lg px-4 py-2 text-sm font-bold ${subtab === 'groups' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500'}`}>ตั้งค่ากลุ่ม</button></div>{subtab === 'monitor' ? <AutoCampaignPanel onOpenAccounts={onOpenAccounts} showSettings={false} /> : subtab === 'groups' ? <GroupsModal embedded open onClose={() => setSubtab('setting')} onSaved={() => {}} /> : <AutoCampaignPanel onOpenAccounts={onOpenAccounts} showSettings />}</div>
 }
 
 function UnifiedPostSetsPanel() {

@@ -33,10 +33,10 @@ describe('Facebook group-card verification', () => {
     expect(scheduleStatusForResults([{ ok: true, verified: 'permalink', postUrl: 'https://facebook.com/groups/1/posts/2' }])).toBe('done')
   })
 
-  it('accepts a freshly submitted matching group card when Facebook hides its permalink', () => {
+  it('keeps a group-card-only result pending because it is not delivery proof', () => {
     const found = { ok: true, submitted: true, verified: 'group_card', postUrl: null }
-    expect(scheduleStatusForResults([found])).toBe('done')
-    expect(isOneTimePostComplete({}, [found])).toBe(true)
+    expect(scheduleStatusForResults([found])).toBe('unconfirmed')
+    expect(isOneTimePostComplete({}, [found])).toBe(false)
   })
 
   it('rejects a group card without evidence that this run submitted it', () => {

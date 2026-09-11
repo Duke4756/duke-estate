@@ -65,7 +65,7 @@ function normalize(list) {
     const marketingTags = typeof g === 'object' && Array.isArray(g.marketingTags) ? [...new Set(g.marketingTags.map((tag) => String(tag).trim().toUpperCase()).filter(Boolean))] : []
     const projectTags = typeof g === 'object' && Array.isArray(g.projectTags) ? [...new Set(g.projectTags.map((tag) => String(tag).trim()).filter(Boolean))] : []
     const projectIds = typeof g === 'object' && Array.isArray(g.projectIds) ? [...new Set(g.projectIds.map((tag) => String(tag).trim()).filter(Boolean))] : []
-    out.push({ url, active: typeof g === 'object' ? g.active !== false : true, category, name, memberCount, marketingTags, projectTags, projectIds, notes: typeof g === 'object' ? String(g.notes || '') : '' })
+    out.push({ url, active: typeof g === 'object' ? g.active !== false : true, category, name, memberCount, marketingTags, projectTags, projectIds, notes: typeof g === 'object' ? String(g.notes || '') : '', zone_tags: typeof g === 'object' && Array.isArray(g.zone_tags) ? [...new Set(g.zone_tags.map((tag) => String(tag).trim().toUpperCase()).filter(Boolean))] : [], project_specific: typeof g === 'object' && g.project_specific === true, project_name: typeof g === 'object' ? (String(g.project_name || '').trim() || null) : null, project_aliases: typeof g === 'object' && Array.isArray(g.project_aliases) ? g.project_aliases.map((x) => String(x).trim()).filter(Boolean) : [], manual_tags: typeof g === 'object' && Array.isArray(g.manual_tags) ? g.manual_tags.map((x) => String(x).trim().toUpperCase()).filter(Boolean) : [] })
   }
   return out
 }

@@ -80,7 +80,7 @@ export class AutopostReliability {
     const attempt = this.db.prepare('SELECT run_id FROM posting_attempts WHERE id=?').get(attemptId)
     if (!attempt) return false
     const now = new Date().toISOString()
-    if (verified === 'permalink' || verified === 'group_card' || postUrl) {
+    if (verified === 'permalink' || postUrl) {
       const method = verified || 'permalink'
       this.db.prepare(`UPDATE posting_attempts SET status='VERIFIED',stage='CONTENT_VERIFIED',verified=?,post_url=?,error_code=NULL,error_message=NULL,fingerprint=NULL,retryable=NULL,safe_to_resubmit=0,finished_at=? WHERE id=?`).run(method, postUrl, now, attemptId)
       this.event(attempt.run_id, attemptId, 'CONTENT_VERIFIED', 'VERIFIED', null, { postUrl, verified: method, delayed: true })

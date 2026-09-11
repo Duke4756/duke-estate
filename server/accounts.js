@@ -12,6 +12,7 @@ const file = path.join(dir, 'accounts.json')
 const primarySession = process.env.FB_SESSION_PATH || path.join(path.dirname(fileURLToPath(import.meta.url)), 'fb-session.json')
 const pending = new Map()
 const pendingMembership = new Map()
+const groupMembershipChecksInFlight = new Set()
 // The public-group login overlay can return to the same guest modal after a
 // successful-looking login. Use Facebook's dedicated login route and send the
 // completed flow to /me so both the operator and status poller get an
@@ -446,6 +447,55 @@ export async function cancelGroupMembership(id) {
   const item = pendingMembership.get(id)
   if (item) await item.browser.close().catch(() => {})
   pendingMembership.delete(id)
+}
+
+// Check group cards with the account's saved Facebook session before the UI
+// decides whether it should offer the operator a join action.  A failed or
+// inconclusive check deliberately remains UNKNOWN: it must never look like
+// evidence that the account has not joined.
+export async function checkGroupMemberships(id, groupUrls = []) {
+  // One scan launches a real browser. Never allow overlapping requests from
+  // polling, the settings screen, and queue creation to multiply browsers.
+  if (groupMembershipChecksInFlight.has(id)) return []
+  const account = read().find((item) => item.id === id)
+  if (!account?.ready || pendingMembership.has(id)) return []
+  const urls = [...new Set((groupUrls || []).map((url) => {
+    try { return normalizeFacebookGroupUrl(url) } catch { return null }
+  }).filter(Boolean))]
+  if (!urls.length) return []
+
+  groupMembershipChecksInFlight.add(id)
+  let browser
+  let context
+  const results = []
+  try {
+    browser = await launchBrowser({ headless: true, args: ['--disable-blink-features=AutomationControlled'] })
+    context = await browser.newContext({ storageState: account.sessionPath, viewport: { width: 1280, height: 900 }, locale: 'th-TH' })
+    await reduceInteractiveContextLoad(context)
+    for (const groupUrl of urls) {
+      const page = await context.newPage()
+      let membership = 'UNKNOWN'
+      try {
+        await page.goto(groupUrl, { waitUntil: 'domcontentloaded', timeout: 30000 })
+        await page.waitForTimeout(2000)
+        membership = await detectGroupMembership(page)
+        if (membership === 'UNKNOWN') {
+          await page.waitForTimeout(2000)
+          membership = await detectGroupMembership(page)
+        }
+      } catch { /* retain UNKNOWN when Facebook cannot be read safely */ }
+      finally { await page.close().catch(() => {}) }
+      // Do not replace a confirmed historical result when Facebook shows a
+      // checkpoint, a rate-limit page, or otherwise cannot be read.
+      if (membership !== 'UNKNOWN') saveGroupMembership(id, groupUrl, membership)
+      results.push({ groupUrl, membership })
+    }
+  } finally {
+    await context?.close().catch(() => {})
+    await browser?.close().catch(() => {})
+    groupMembershipChecksInFlight.delete(id)
+  }
+  return results
 }
 
 export function removeAccount(id) {

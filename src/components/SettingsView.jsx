@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { authorizeSource, controlSourceLane, getOwnerRulesStatus, getSourceCoverage, getSources, importSourceCandidates, refreshOwnerRules, setSourceStatus } from '../api'
+import GroupsModal from './GroupsModal'
 
 export default function SettingsView() {
   const [status, setStatus] = useState(null)
@@ -10,6 +11,7 @@ export default function SettingsView() {
   const [sourceState, setSourceState] = useState(null)
   const [url, setUrl] = useState('')
   const [importResult, setImportResult] = useState(null)
+  const [settingsTab, setSettingsTab] = useState('owner')
   const load = async (refresh = false) => {
     setLoading(true); setError('')
     try {
@@ -22,7 +24,9 @@ export default function SettingsView() {
   useEffect(() => { load() }, [])
   const act = async (action) => { setLoading(true); setError(''); try { await action(); await load() } catch (e) { setError(e.message); setLoading(false) } }
   return <main className="mx-auto max-w-5xl px-5 py-8">
-    <div className="flex items-start justify-between gap-4"><div><h2 className="text-xl font-bold text-slate-800">⚙️ Owner Extraction Settings</h2><p className="mt-1 text-sm text-slate-500">กฎการดึงข้อมูลทำงานจากฐานข้อมูลในโปรแกรม</p></div><button disabled={loading} onClick={() => load(true)} className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-bold text-white disabled:opacity-50">{loading ? 'กำลังโหลด…' : '↻ Refresh Rules'}</button></div>
+    <div className="flex items-start justify-between gap-4"><div><h2 className="text-xl font-bold text-slate-800">⚙️ Settings</h2><p className="mt-1 text-sm text-slate-500">ตั้งค่าการดึงข้อมูลและการจัดหมวดหมู่กลุ่ม</p></div><button disabled={loading} onClick={() => load(true)} className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-bold text-white disabled:opacity-50">{loading ? 'กำลังโหลด…' : '↻ Refresh Rules'}</button></div>
+    <div className="mt-5 flex gap-2 border-b border-slate-200"><button type="button" onClick={() => setSettingsTab('owner')} className={`rounded-t-xl px-4 py-2 text-sm font-bold ${settingsTab === 'owner' ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-600'}`}>Owner Rules</button><button type="button" onClick={() => setSettingsTab('groups')} className={`rounded-t-xl px-4 py-2 text-sm font-bold ${settingsTab === 'groups' ? 'bg-violet-600 text-white' : 'bg-slate-100 text-slate-600'}`}>ตั้งค่ากลุ่ม</button></div>
+    {settingsTab === 'groups' ? <GroupsModal embedded open onClose={() => setSettingsTab('owner')} onSaved={() => {}} /> : <>
     {error && <p className="mt-4 rounded-xl bg-rose-50 p-3 text-sm text-rose-700">⚠️ {error}</p>}
     <div className="mt-5 grid gap-3 sm:grid-cols-3"><Stat label="Projects" value={status?.counts?.projects || 0} /><Stat label="Aliases" value={status?.counts?.aliases || 0} /><Stat label="Keywords" value={status?.counts?.keywords || 0} /></div>
     <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-600"><p><b>โหลดล่าสุด:</b> {status?.loadedAt ? new Date(status.loadedAt).toLocaleString('th-TH') : 'ยังไม่เคยโหลด'}</p>{status?.lastError && <p className="mt-2 text-rose-600"><b>ข้อผิดพลาดล่าสุด:</b> {status.lastError}</p>}</div>
@@ -34,6 +38,7 @@ export default function SettingsView() {
       <div className="mt-4 max-h-80 overflow-auto rounded-xl border border-slate-200"><table className="w-full text-left text-xs"><thead className="sticky top-0 bg-slate-50 text-slate-500"><tr><th className="p-3">กลุ่ม</th><th className="p-3">สิทธิ์</th><th className="p-3">สถานะ</th><th className="p-3">Value</th><th className="p-3"></th></tr></thead><tbody>{sources.map((source) => <tr key={source.id} className="border-t border-slate-100"><td className="p-3"><a href={source.canonical_url} target="_blank" rel="noreferrer" className="font-semibold text-indigo-600">{source.group_name || source.source_group_id || source.canonical_url}</a></td><td className="p-3">{source.authorization_status}</td><td className="p-3">{source.status}</td><td className="p-3">{Number(source.unique_listing_yield || 0).toFixed(2)}</td><td className="p-3 text-right">{source.authorization_status !== 'AUTHORIZED' ? <button onClick={() => act(() => authorizeSource(source.id))} className="font-bold text-emerald-600">ยืนยันสิทธิ์</button> : <button onClick={() => act(() => setSourceStatus(source.id, source.status === 'ACTIVE' ? 'PAUSED' : 'ACTIVE'))} className="font-bold text-slate-600">{source.status === 'ACTIVE' ? 'พัก' : 'เปิด'}</button>}</td></tr>)}</tbody></table></div>
       <p className="mt-3 text-xs text-amber-700">{coverage?.disclaimer}</p>
     </section>
+    </>}
   </main>
 }
 function Stat({ label, value }) { return <div className="rounded-2xl border border-slate-200 bg-white p-5"><p className="text-xs text-slate-500">{label}</p><p className="mt-1 text-3xl font-bold text-slate-800">{Number(value).toLocaleString('th-TH')}</p></div> }

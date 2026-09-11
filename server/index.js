@@ -36,6 +36,7 @@ import {
   groupMembershipStatus,
   finishGroupMembership,
   cancelGroupMembership,
+  checkGroupMemberships,
   removeAccount,
   interactiveAccountBrowserOpen,
 } from './accounts.js'
@@ -58,7 +59,9 @@ import { refreshListingFreshness } from './db/repositories/listingClusters.js'
 import { pruneExtractionCache } from './db/repositories/cache.js'
 import { PIPELINE_VERSION } from './pipeline/versions.js'
 import { autopostReliability } from './autopostReliability.js'
+import { classifyGroups } from './groupClassification.js'
 import { parseCampaignCsv, previewCampaignCsv, campaignId, readAppliedCampaigns, saveAppliedCampaign } from './campaignCsv.js'
+import { planCampaign, materializeCampaignPlan, repairCampaignQueue } from './campaignRuleEngine.js'
 
 dotenv.config()
 
@@ -265,8 +268,60 @@ app.put('/api/posting-settings', (req, res) => {
 app.get('/api/auto-campaign', (_req, res) => {
   res.json({ campaign: getAutoCampaign() })
 })
+app.get('/api/campaign-engine/groups', async (req, res) => {
+  const accountId = String(req.query.accountId || '')
+  const account = listAccounts().find((item) => item.id === accountId && item.ready)
+  if (!account) return res.status(400).json({ error: 'บัญชีที่เลือกยังไม่พร้อมใช้งาน' })
+  const groups = classifyGroups(loadGroupsFull())
+    // Return every usable group, not just ones already known as MEMBER.  The
+    // settings screen uses this to let an operator join an unjoined group.
+    // Scheduling still enforces membership in planCampaign.
+    .filter((group) => group.active !== false && !group.needsReview)
+  // The first response must be fast so a new account can see its group list
+  // immediately. The client follows it with a membership-refresh request.
+  const checkedGroups = req.query.refreshMembership === '1'
+    ? await checkGroupMemberships(accountId, groups.map((group) => group.url)).catch(() => [])
+    : []
+  const checkedByUrl = new Map(checkedGroups
+    .filter((item) => item.membership !== 'UNKNOWN')
+    .map((item) => [item.groupUrl, item.membership]))
+  res.json({ groups: groups.map((group) => ({ ...group, label: group.name || groupLabel(group.url), membership: checkedByUrl.get(group.url) || groupMembershipFor(accountId, group.url) })) })
+})
+app.post('/api/campaign-engine/preview', (req, res) => {
+  try {
+    const body = req.body || {}
+    const selectedUrls = new Set(Array.isArray(body.targetGroupUrls) ? body.targetGroupUrls : [])
+    const groups = classifyGroups(loadGroupsFull()).filter((group) => !selectedUrls.size || selectedUrls.has(group.url))
+    const allAccounts = listAccounts()
+    const accounts = body.accountId ? allAccounts.filter((account) => account.id === body.accountId) : allAccounts
+    const roundsPerProperty = Math.max(1, Number(body.rounds) || 1)
+    const plan = planCampaign({ ...body, rounds: roundsPerProperty, postingWindow: getAutoCampaign().postingWindow, groups, accounts })
+    res.json({ ...plan, summary: { properties: new Set(plan.placements.map((x) => x.cd)).size, groups: new Set(plan.placements.map((x) => x.group)).size, accounts: new Set(plan.placements.map((x) => x.accountId)).size, queue24h: plan.placements.length } })
+  } catch (error) { res.status(400).json({ error: error.message }) }
+})
+app.post('/api/campaign-engine/start', async (req, res) => {
+  try {
+    const body = req.body || {}
+    const selectedUrls = new Set(Array.isArray(body.targetGroupUrls) ? body.targetGroupUrls : [])
+    const groups = classifyGroups(loadGroupsFull()).filter((group) => !selectedUrls.size || selectedUrls.has(group.url))
+    // A selection may have been made while the background check was still
+    // running. Verify the exact target groups once more before planning so the
+    // planner never rejects a group merely because its saved status is stale.
+    const membershipResults = body.accountId
+      ? await checkGroupMemberships(body.accountId, groups.map((group) => group.url)).catch(() => [])
+      : []
+    const allAccounts = listAccounts()
+    const accounts = body.accountId ? allAccounts.filter((account) => account.id === body.accountId) : allAccounts
+    const roundsPerProperty = Math.max(1, Number(body.rounds) || 1)
+    const plan = planCampaign({ ...body, rounds: roundsPerProperty, postingWindow: getAutoCampaign().postingWindow, groups, accounts })
+    const schedules = materializeCampaignPlan(plan, { name: body.name || 'Campaign' })
+    const repaired = repairCampaignQueue({ postingWindow: getAutoCampaign().postingWindow })
+    res.json({ ...plan, schedules, repaired, membershipResults })
+  } catch (error) { res.status(400).json({ error: error.message }) }
+})
 app.get('/api/auto-campaign/status', (_req, res) => {
   const statusNow = Date.now()
+  repairCampaignQueue({ postingWindow: getAutoCampaign().postingWindow, now: statusNow })
   const bangkokDay = (value = new Date()) => new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit',
   }).format(new Date(value))
@@ -275,7 +330,7 @@ app.get('/api/auto-campaign/status', (_req, res) => {
   const accounts = new Map(listAccounts().map((account) => [account.id, account.name]))
   const sets = listSets().filter(isPublishableRentalPostSet)
   const runs = listSchedules()
-    .filter((schedule) => schedule.source === 'auto')
+    .filter((schedule) => ['auto', 'campaign'].includes(schedule.source))
     .slice(0, 20)
     .map((schedule) => {
       const displayStatus = displayScheduleStatus(schedule, statusNow)
@@ -342,10 +397,27 @@ app.get('/api/auto-campaign/status', (_req, res) => {
     empty: campaign.mode === 'account_schedule' ? sets.length === 0 : availableInventory.length === 0,
     blockedReason: availableInventory.length === 0 ? 'inventory_empty' : null,
   }
-  const plans = campaign.accountIds.map((accountId) => {
+  const planAccountIds = [...new Set([
+    ...(campaign.accountIds || []),
+    ...listSchedules().filter((run) => run.source === 'campaign' && ['pending', 'posting'].includes(run.status)).map((run) => run.accountId),
+  ].filter(Boolean))]
+  const plans = planAccountIds.map((accountId) => {
+    const campaignRun = listSchedules().find((run) => run.accountId === accountId && run.source === 'campaign' && ['pending', 'posting'].includes(run.status))
+    if (campaignRun) {
+      const set = sets.find((item) => item.id === campaignRun.postSetId)
+      return {
+        accountId,
+        accountName: accounts.get(accountId) || 'บัญชีหลัก',
+        nextRunAt: campaignRun.runAt,
+        nextPostSetId: campaignRun.postSetId,
+        nextPostSetName: set?.name || campaignRun.name,
+        state: campaignRun.status === 'posting' ? 'posting' : 'ready',
+        randomPostSet: false,
+      }
+    }
     if (campaign.mode === 'account_schedule') {
       const rule = campaign.accountRules[accountId]
-      const active = listSchedules().find((run) => run.accountId === accountId && run.source === 'auto' && ['pending', 'posting'].includes(run.status))
+      const active = listSchedules().find((run) => run.accountId === accountId && ['auto', 'campaign'].includes(run.source) && ['pending', 'posting'].includes(run.status))
       const next = nextAccountOccurrence(rule, campaign.accountState?.[accountId]?.lastOccurrence, statusNow)
       const nextSet = sets.find((set) => set.id === (active?.postSetId || rule?.slots?.[0]?.postSetId))
       return { accountId, accountName: accounts.get(accountId) || 'บัญชีหลัก', nextRunAt: active?.runAt || (next === null ? null : new Date(next).toISOString()),
@@ -364,6 +436,20 @@ app.get('/api/auto-campaign/status', (_req, res) => {
       randomPostSet: false,
     }
   })
+  const campaignQueuePlans = listSchedules()
+    .filter((run) => run.source === 'campaign' && ['pending', 'posting'].includes(run.status))
+    .sort((a, b) => new Date(a.runAt).getTime() - new Date(b.runAt).getTime())
+    .map((run) => ({
+      accountId: run.accountId || 'primary',
+      accountName: accounts.get(run.accountId || 'primary') || 'บัญชีหลัก',
+      nextRunAt: run.runAt,
+      nextPostSetId: run.postSetId,
+      nextPostSetName: sets.find((set) => set.id === run.postSetId)?.name || run.name,
+      state: run.status === 'posting' ? 'posting' : 'ready',
+      randomPostSet: false,
+      scheduleId: run.id,
+    }))
+  const displayPlans = campaignQueuePlans.length ? campaignQueuePlans : plans
   const historyByDay = new Map()
   for (const schedule of listSchedules()) {
     const accountId = schedule.accountId || 'primary'
@@ -401,7 +487,7 @@ app.get('/api/auto-campaign/status', (_req, res) => {
     ...todayStats,
     history: dailyHistory,
   }
-  res.json({ campaign, runs, plans, inventory, dailyStats, serverTime: new Date().toISOString() })
+  res.json({ campaign, runs, plans: displayPlans, inventory, dailyStats, serverTime: new Date().toISOString() })
 })
 app.put('/api/auto-campaign', (req, res) => {
   try {
@@ -1146,6 +1232,13 @@ app.get('/api/groups', (req, res) => {
     groups: loadGroupsFull().map((g) => ({ ...g, label: g.name || groupLabel(g.url) })),
   })
 })
+app.post('/api/groups/classify-preview', (_req, res) => {
+  const groups = loadGroupsFull(); const classified = classifyGroups(groups)
+  res.json({ groups: classified, summary: { total: classified.length, condo: classified.filter((g) => g.category === 'CONDO').length, house: classified.filter((g) => g.category === 'HOUSE').length, projectSpecific: classified.filter((g) => g.project_specific).length, needReview: classified.filter((g) => g.needsReview).length, zones: Object.fromEntries([...new Set(classified.flatMap((g) => g.zone_tags || []))].map((zone) => [zone, classified.filter((g) => (g.zone_tags || []).includes(zone)).length])) } })
+})
+app.post('/api/groups/classify-apply', (_req, res) => {
+  const groups = classifyGroups(loadGroupsFull()); const saved = saveGroups(groups); res.json({ groups: saved, applied: true })
+})
 
 app.post('/api/groups/resolve-names', async (req, res) => {
   const urls = Array.isArray(req.body?.urls) ? req.body.urls : loadGroupsFull().map((group) => group.url)
@@ -1179,6 +1272,11 @@ app.put('/api/groups', (req, res) => {
       marketingTags: typeof g === 'object' && Array.isArray(g.marketingTags) ? [...new Set(g.marketingTags.map((tag) => String(tag).trim().toUpperCase()).filter(Boolean))] : [],
       projectTags: typeof g === 'object' && Array.isArray(g.projectTags) ? [...new Set(g.projectTags.map((tag) => String(tag).trim()).filter(Boolean))] : [],
       projectIds: typeof g === 'object' && Array.isArray(g.projectIds) ? [...new Set(g.projectIds.map((tag) => String(tag).trim()).filter(Boolean))] : [],
+      zone_tags: typeof g === 'object' && Array.isArray(g.zone_tags) ? [...new Set(g.zone_tags.map((tag) => String(tag).trim().toUpperCase()).filter(Boolean))] : [],
+      project_specific: typeof g === 'object' && g.project_specific === true,
+      project_name: typeof g === 'object' ? String(g.project_name || '').trim() || null : null,
+      project_aliases: typeof g === 'object' && Array.isArray(g.project_aliases) ? g.project_aliases.map((tag) => String(tag).trim()).filter(Boolean) : [],
+      manual_tags: typeof g === 'object' && Array.isArray(g.manual_tags) ? g.manual_tags.map((tag) => String(tag).trim().toUpperCase()).filter(Boolean) : [],
       notes: typeof g === 'object' ? String(g.notes || '') : '',
     }))
     .filter((g) => g.url)

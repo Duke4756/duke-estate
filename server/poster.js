@@ -744,9 +744,9 @@ async function submitAndWait(page, dialog, text, groupUrl, evidence = {}, onSubm
     }
   }
 
-  // The authoritative check is the matching post card inside this group. The
-  // permalink is optional metadata because Facebook does not expose it in all
-  // feed variants.
+  // A search-result card is useful for diagnostics only. Delivery requires a
+  // permalink (or Facebook's create receipt above), otherwise an unrelated
+  // recent post can be mistaken for this account's submission.
   const published = await findPublishedPost(page, text, linksBefore, matchingCardsBefore, groupUrl, evidence)
   const reference = postVerificationMarkers(text).find((marker) => /\b[A-Z]{1,8}-\d{3,}\b/i.test(marker)) || null
   const diagnosticEvidenceUrl = published.foundInGroup ? null : await capturePostEvidence(page, {
@@ -757,7 +757,7 @@ async function submitAndWait(page, dialog, text, groupUrl, evidence = {}, onSubm
     postUrl: published.postUrl,
     evidenceUrl: published.evidenceUrl || diagnosticEvidenceUrl || null,
     publishDiagnostics: receiptWatcher.diagnostics,
-    verified: published.foundInGroup ? (published.postUrl ? 'permalink' : 'group_card') : 'unconfirmed',
+    verified: published.postUrl ? 'permalink' : 'unconfirmed',
   }
 }
 
@@ -1139,21 +1139,10 @@ export async function reverifyUnconfirmedSchedules({ maxResults = 3, onStep = ()
       const submittedAt = (result.publishDiagnostics || [])
         .find((diagnostic) => diagnostic.expectedCreate === true)?.at
         || result.at || schedule.finishedAt
-      // Some Facebook layouts visually render the exact search result but do
-      // not expose its expanded text to Playwright. A successful create
-      // mutation plus the captured result screen is still independent proof;
-      // promote it without ever submitting the room again.
-      const hasCapturedCreateReceipt = Boolean(result.evidenceUrl
-        && (result.publishDiagnostics || []).some((diagnostic) =>
-          diagnostic.expectedCreate === true && Number(diagnostic.status) >= 200 && Number(diagnostic.status) < 300))
-      const searchedEvidence = hasCapturedCreateReceipt
-        ? null
-        : await findDelayedPermalink(page, result.group, preparePostText(set.text || ''), submittedAt, { attemptId: evidenceId, accountId })
-      const evidence = searchedEvidence || (hasCapturedCreateReceipt ? {
-        verified: 'group_card',
-        postUrl: null,
-        evidenceUrl: result.evidenceUrl,
-      } : null)
+      // Re-check without submitting again. A card in group search is never
+      // enough; the delayed check must expose the actual post permalink.
+      const searchedEvidence = await findDelayedPermalink(page, result.group, preparePostText(set.text || ''), submittedAt, { attemptId: evidenceId, accountId })
+      const evidence = searchedEvidence?.verified === 'permalink' ? searchedEvidence : null
       const permalink = evidence?.postUrl || null
       await page.close().catch(() => {})
       const now = new Date().toISOString()

@@ -7,6 +7,9 @@ export function validateAccountPlan(rule, { allowIncomplete = false } = {}) {
   const slots = Array.isArray(rule.slots) ? rule.slots : legacySlots
   if (!allowIncomplete && !slots.length) throw new Error('เพิ่มรายการโพสต์เฉพาะอย่างน้อย 1 รายการ')
   if (slots.some((slot) => !slot.postSetId || !(Array.isArray(slot.groups) ? slot.groups : [slot.group]).every(Boolean) || !(Array.isArray(slot.times) ? slot.times : [slot.time]).every((time) => /^([01]\d|2[0-3]):[0-5]\d$/.test(time || '')))) throw new Error('แต่ละรายการต้องมีทรัพย์ กลุ่ม และเวลาโพสต์')
+  // Disabled/empty accounts do not have a posting date to validate. They are
+  // retained only so an operator can configure them later.
+  if (allowIncomplete && !slots.length && !rule.startDate) return { slots: [], startDate: null, time: '09:00', repeatDaily: false, intervalMinutes: 30 }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(rule.startDate || '')) throw new Error('ระบุวันที่โพสต์ให้ครบทุกบัญชี')
   const firstTime = rule.time || slots[0]?.time || '09:00'
   const start = Date.parse(`${rule.startDate}T${firstTime}:00+07:00`)

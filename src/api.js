@@ -554,6 +554,11 @@ export async function getGroups() {
   if (!res.ok) throw new Error(`Request failed (${res.status})`)
   return res.json() // { groups: [{url, label}] }
 }
+export async function previewCampaignEngine(input) { const res = await fetch('/api/campaign-engine/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }); const body = await res.json().catch(() => ({})); if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`); return body }
+export async function startCampaignEngine(input) { const res = await fetch('/api/campaign-engine/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }); const body = await res.json().catch(() => ({})); if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`); return body }
+export async function getCampaignGroups(accountId, { refreshMembership = false } = {}) { const query = refreshMembership ? '&refreshMembership=1' : ''; const res = await fetch(`/api/campaign-engine/groups?accountId=${encodeURIComponent(accountId)}${query}`); const body = await res.json().catch(() => ({})); if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`); return body }
+export async function previewGroupClassification() { const res = await fetch('/api/groups/classify-preview', { method: 'POST' }); const body = await res.json().catch(() => ({})); if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`); return body }
+export async function applyGroupClassification() { const res = await fetch('/api/groups/classify-apply', { method: 'POST' }); const body = await res.json().catch(() => ({})); if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`); return body }
 export async function getProjects() { const res = await fetch('/api/properties/projects'); if (!res.ok) throw new Error(`Request failed (${res.status})`); return res.json() }
 
 export async function getGroupCrawlHistory() {

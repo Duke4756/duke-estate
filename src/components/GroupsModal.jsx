@@ -1,9 +1,8 @@
 import { useEffect, useState } from 'react'
 import { getGroups, saveGroups, resolveGroupNames, getProjects } from '../api'
 import { hasGroup } from '../groupUrl'
-import { GROUP_SETS } from '../groupSets'
 
-export default function GroupsModal({ open, onClose, onSaved }) {
+export default function GroupsModal({ open, onClose, onSaved, embedded = false }) {
   const [items, setItems] = useState([]) // [{ url, active }]
   const [draft, setDraft] = useState('')
   const [loading, setLoading] = useState(false)
@@ -12,6 +11,9 @@ export default function GroupsModal({ open, onClose, onSaved }) {
   const [resolving, setResolving] = useState(false)
   const [projects, setProjects] = useState([])
   const [query, setQuery] = useState('')
+  const [newCategory, setNewCategory] = useState('')
+  const [newZone, setNewZone] = useState('')
+  const [customCategories, setCustomCategories] = useState([])
 
   useEffect(() => {
     if (!open) return
@@ -19,7 +21,7 @@ export default function GroupsModal({ open, onClose, onSaved }) {
     setLoading(true)
     getGroups()
       .then((d) => setItems((d.groups || []).map((g) => ({
-        url: g.url, active: g.active !== false, category: g.category || 'general', name: g.name || '', marketingTags: g.marketingTags || [], projectTags: g.projectTags || [], notes: g.notes || '',
+        url: g.url, active: g.active !== false, category: g.category || 'general', name: g.name || '', marketingTags: g.marketingTags || [], projectTags: g.projectTags || [], notes: g.notes || '', zone_tags: g.zone_tags || [], project_specific: g.project_specific === true, project_name: g.project_name || '', project_aliases: g.project_aliases || [], manual_tags: g.manual_tags || [],
       }))))
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
@@ -43,7 +45,7 @@ export default function GroupsModal({ open, onClose, onSaved }) {
       return
     }
     const urls = v.split(/\s+/).filter(Boolean)
-    setItems(urls.reduce((list, url) => hasGroup(list, url) ? list : [...list, { url, active: true, category: 'general', name: '', marketingTags: [], projectTags: [], notes: '' }], items))
+    setItems(urls.reduce((list, url) => hasGroup(list, url) ? list : [...list, { url, active: true, category: 'general', name: '', marketingTags: [], projectTags: [], notes: '', zone_tags: [], project_specific: false, project_name: '', project_aliases: [], manual_tags: [] }], items))
     setDraft('')
     setError(null)
   }
@@ -54,6 +56,27 @@ export default function GroupsModal({ open, onClose, onSaved }) {
 
   function update(url, patch) {
     setItems(items.map((g) => (g.url === url ? { ...g, ...patch } : g)))
+  }
+
+  const categories = [...new Set(['CONDO', 'HOUSE', ...customCategories, ...items.map((item) => item.category).filter(Boolean)])]
+  const zones = [...new Set(items.flatMap((item) => item.zone_tags || []))].sort()
+  function addCategory() {
+    const value = newCategory.trim().toUpperCase()
+    if (!value || categories.includes(value)) return
+    setCustomCategories((current) => [...new Set([...current, value])])
+    setNewCategory('')
+  }
+  function removeCategory(value) {
+    if (['CONDO', 'HOUSE'].includes(value)) return
+    setCustomCategories((current) => current.filter((category) => category !== value))
+    setItems(items.map((item) => item.category === value ? { ...item, category: 'general' } : item))
+  }
+  function addZone() {
+    const value = newZone.trim().toUpperCase()
+    if (!value) return
+    setItems(items.map((item) => item.zone_tags?.includes(value) ? item : item))
+    setNewZone('')
+    setQuery(value)
   }
 
   async function handleSave() {
@@ -82,15 +105,15 @@ export default function GroupsModal({ open, onClose, onSaved }) {
 
   return (
     <div
-      className="fixed inset-0 z-50 grid place-items-center bg-slate-900/40 p-4"
+      className={embedded ? 'w-full' : 'fixed inset-0 z-50 grid place-items-center bg-slate-900/40 p-4'}
       onClick={onClose}
     >
       <div
-        className="w-full max-w-2xl rounded-2xl bg-white shadow-xl"
+        className={embedded ? 'w-full rounded-2xl border border-slate-200 bg-white shadow-sm' : 'w-full max-w-2xl rounded-2xl bg-white shadow-xl'}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
-          <div><h2 className="text-base font-bold text-slate-800">⚙️ คลังกลุ่ม Facebook</h2><p className="mt-1 text-[11px] text-slate-400">ชื่อกลุ่มจะแสดงในหน้าตั้งค่าแทนรหัส URL</p></div>
+          <div><h2 className="text-base font-bold text-slate-800">⚙️ ตั้งค่ากลุ่ม Facebook</h2><p className="mt-1 text-[11px] text-slate-400">หมวดหลัก: Condo / House · หมวดย่อย: Zone</p></div>
           <button type="button" disabled={resolving || loading || !items.length} onClick={resolveNames} className="mr-2 rounded-lg bg-indigo-50 px-3 py-1.5 text-xs font-bold text-indigo-700 disabled:opacity-50">{resolving ? 'กำลังเปิดตรวจ…' : '↻ ดึงชื่อจาก Facebook'}</button>
           <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-xl leading-none">
             ✕
@@ -99,9 +122,8 @@ export default function GroupsModal({ open, onClose, onSaved }) {
 
         <div className="px-5 py-4 space-y-3">
           <datalist id="project-master-options">{projects.map((project) => <option key={project.id} value={project.id}>{project.canonical_name}</option>)}</datalist><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="ค้นหากลุ่มหรือโครงการ…" className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm" />
-          <p className="text-xs text-slate-400">
-            คลังนี้ใช้ร่วมกันทั้งค้นหาโพสต์และโพสต์อัตโนมัติ — จัดกลุ่มเป็นชุดเพื่อเรียกใช้พร้อมกันได้
-          </p>
+          <div className="rounded-xl border border-indigo-100 bg-indigo-50 p-3"><p className="text-xs font-bold text-indigo-900">หมวดหมู่และโซน</p><div className="mt-2 flex flex-wrap gap-2">{categories.map((category) => <span key={category} className="inline-flex items-center gap-1 rounded-full bg-white px-2 py-1 text-[11px] font-semibold text-indigo-700">{category}{!['CONDO', 'HOUSE'].includes(category) && <button type="button" onClick={() => removeCategory(category)} title="ลบหมวดนี้" className="font-black text-rose-500">×</button>}</span>)}<input value={newCategory} onChange={(e) => setNewCategory(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addCategory()} placeholder="สร้างหมวดหลัก" className="w-32 rounded-lg border px-2 py-1 text-xs" /><button type="button" onClick={addCategory} className="rounded-lg bg-indigo-600 px-2 py-1 text-xs font-bold text-white">เพิ่ม</button></div><div className="mt-2 flex flex-wrap gap-2">{zones.map((zone) => <span key={zone} className="rounded-full bg-white px-2 py-1 text-[11px] font-semibold text-emerald-700">{zone}</span>)}<input value={newZone} onChange={(e) => setNewZone(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addZone()} placeholder="สร้างโซนย่อย" className="w-32 rounded-lg border px-2 py-1 text-xs" /><button type="button" onClick={addZone} className="rounded-lg bg-emerald-600 px-2 py-1 text-xs font-bold text-white">เพิ่ม</button></div></div>
+          <p className="text-xs text-slate-400">ตั้งหมวด/โซนให้แต่ละกลุ่มได้จากช่องในรายการด้านล่าง แล้วกดบันทึก</p>
 
           {loading ? (
             <p className="text-sm text-slate-400 py-4 text-center">กำลังโหลด...</p>
@@ -125,17 +147,20 @@ export default function GroupsModal({ open, onClose, onSaved }) {
                       className="mb-1 w-full bg-transparent text-sm font-medium text-slate-700 outline-none"
                     />
                     <p className="text-[11px] text-slate-400 truncate">{g.url}{g.memberCount ? ` · สมาชิก ${g.memberCount.toLocaleString('th-TH')} คน` : ''}</p>
-                    <input value={(g.marketingTags || []).join(',')} onChange={(e) => update(g.url, { marketingTags: e.target.value.split(',').map((x) => x.trim().toUpperCase()).filter(Boolean) })} placeholder="Tags: EXPAT,SUKHUMVIT" className="mt-1 w-full bg-transparent text-[11px] text-indigo-600 outline-none" />
+                    {String(g.category).toUpperCase() === 'CONDO' && <input value={(g.marketingTags || []).join(',')} onChange={(e) => update(g.url, { marketingTags: e.target.value.split(',').map((x) => x.trim().toUpperCase()).filter(Boolean) })} placeholder="Tag เป้าหมาย: EXPAT,OWNER" className="mt-1 w-full bg-transparent text-[11px] text-indigo-600 outline-none" />}
                     <input value={(g.projectTags || []).join(',')} onChange={(e) => update(g.url, { projectTags: e.target.value.split(',').map((x) => x.trim()).filter(Boolean) })} placeholder="โครงการ: Siri Residence" className="mt-1 w-full bg-transparent text-[11px] text-violet-600 outline-none" />
+                    {String(g.category).toUpperCase() === 'CONDO' && <input value={(g.zone_tags || []).join(',')} onChange={(e) => update(g.url, { zone_tags: e.target.value.split(',').map((x) => x.trim().toUpperCase()).filter(Boolean) })} placeholder="โซน: SUKHUMVIT, RAMA9_RATCHADA, GENERAL" className="mt-1 w-full bg-transparent text-[11px] text-emerald-600 outline-none" />}
                     <input list="project-master-options" value={(g.projectIds || []).join(',')} onChange={(e) => update(g.url, { projectIds: e.target.value.split(',').map((x) => x.trim()).filter(Boolean) })} placeholder="Project ID หลายรายการ" className="mt-1 w-full bg-transparent text-[11px] text-emerald-600 outline-none" />
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
                     <select
-                      value={g.category}
-                      onChange={(e) => update(g.url, { category: e.target.value })}
+                      value={['CONDO', 'HOUSE'].includes(String(g.category).toUpperCase()) ? String(g.category).toUpperCase() : ''}
+                      onChange={(e) => update(g.url, { category: e.target.value, ...(e.target.value === 'HOUSE' ? { zone_tags: [] } : {}) })}
                       className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs"
                     >
-                      {GROUP_SETS.map((set) => <option key={set.id} value={set.id}>{set.label}</option>)}
+                      <option value="">ยังไม่จัดหมวด</option>
+                      <option value="CONDO">คอนโด</option>
+                      <option value="HOUSE">บ้าน</option>
                     </select>
                     {/* Active toggle */}
                     <button

@@ -5,6 +5,8 @@ import {
   getAccounts,
   getAutoCampaign,
   getAutoCampaignStatus,
+  getSchedules,
+  deleteSchedule,
   getGroups,
   getPostSets,
   openAutopostEvidenceFolder,
@@ -16,6 +18,11 @@ import {
 
 const isFacebookPostPermalink = (value = '') =>
   /^https?:\/\/(?:www\.|web\.)?facebook\.com\/groups\/[^/]+\/(?:posts|permalink)\/\d+/i.test(String(value))
+const groupKey = (value = '') => (String(value).match(/facebook\.com\/groups\/([^/?#]+)/i)?.[1] || String(value)).toLowerCase()
+const groupTitle = (groupUrl, groups = []) => {
+  const group = groups.find((item) => groupKey(item.url) === groupKey(groupUrl))
+  return group?.name || group?.label || (String(groupUrl).match(/groups\/([^/?]+)/) || [])[1] || groupUrl
+}
 
 export default function AutoCampaignPanel({ onOpenAccounts = () => {}, showSettings = true }) {
   const [campaign, setCampaign] = useState(null)
@@ -30,6 +37,7 @@ export default function AutoCampaignPanel({ onOpenAccounts = () => {}, showSetti
   const [openingFolder, setOpeningFolder] = useState(false)
   const [backendOnline, setBackendOnline] = useState(null)
   const [joining, setJoining] = useState(null)
+  const [membershipRevision, setMembershipRevision] = useState(0)
   const [membershipClearedAt, setMembershipClearedAt] = useState(() => Number(localStorage.getItem('membershipIssuesClearedAt') || 0))
 
   useEffect(() => {
@@ -62,11 +70,16 @@ export default function AutoCampaignPanel({ onOpenAccounts = () => {}, showSetti
 
   useEffect(() => {
     let stopped = false
-    const refreshStatus = () => Promise.all([getAutoCampaignStatus(), getPostSets()])
-      .then(([data, setData]) => {
+    const refreshStatus = () => Promise.all([getAutoCampaignStatus(), getPostSets(), getSchedules()])
+      .then(([data, setData, scheduleData]) => {
         if (stopped) return
         setBackendOnline(true)
-        setRuntime(data)
+        const accountNames = new Map((accounts || []).map((account) => [account.id, account.name]))
+        const campaignPlans = (scheduleData.schedules || [])
+          .filter((schedule) => schedule.source === 'campaign' && ['pending', 'posting'].includes(schedule.status))
+          .sort((a, b) => new Date(a.runAt).getTime() - new Date(b.runAt).getTime())
+          .map((schedule) => ({ accountId: schedule.accountId || 'primary', accountName: accountNames.get(schedule.accountId || 'primary') || schedule.accountId || 'บัญชีหลัก', nextRunAt: schedule.runAt, nextPostSetId: schedule.postSetId, nextPostSetName: schedule.name, group: schedule.groups?.[0] || null, state: schedule.status === 'posting' ? 'posting' : 'ready', scheduleId: schedule.id }))
+        setRuntime({ ...data, plans: campaignPlans.length ? campaignPlans : data.plans })
         setSets(setData.postsets || [])
         if ((setData.postsets || []).length > 0) {
           setError((current) => current?.startsWith('ไม่มีชุดโพสต์เหลือ') ? null : current)
@@ -109,10 +122,19 @@ export default function AutoCampaignPanel({ onOpenAccounts = () => {}, showSetti
     finally { setOpeningFolder(false) }
   }
 
+  async function deleteQueuedCampaign(scheduleId) {
+    if (!scheduleId) return
+    try {
+      await deleteSchedule(scheduleId)
+      setRuntime((current) => ({ ...current, plans: (current.plans || []).filter((plan) => plan.scheduleId !== scheduleId), runs: (current.runs || []).filter((run) => run.id !== scheduleId) }))
+    } catch (e) { setError(e.message) }
+  }
+
   function configuredCampaign(current) {
     const accountRules = { ...(current.accountRules || {}) }
     for (const { id } of accounts) if (!accountRules[id]) accountRules[id] = defaultAccountPlan(current, id)
-    return { ...current, mode: 'account_schedule', postSetIds: [], groups: [], accountRules }
+    const known = new Set(accounts.map(({ id }) => id))
+    return { ...current, mode: 'account_schedule', accountIds: (current.accountIds || []).filter((id) => known.has(id)), postSetIds: [], groups: [], accountRules }
   }
 
   async function submit(event) {
@@ -139,6 +161,10 @@ export default function AutoCampaignPanel({ onOpenAccounts = () => {}, showSetti
 
   async function setEnabled(enabled) {
     if (saving) return
+    if (enabled && !(campaign.accountIds || []).length) {
+      setError('หน้านี้สร้างคิวตามบัญชีที่เลือกได้ทันที ไม่ต้องเปิดโหมดโพสต์อัตโนมัติ')
+      return
+    }
     const next = { ...configuredCampaign(campaign), enabled }
     setCampaign(next)
     setSaving(true)
@@ -174,7 +200,10 @@ export default function AutoCampaignPanel({ onOpenAccounts = () => {}, showSetti
     try {
       const result = await finishGroupMembership(joining.accountId)
       setJoining(null)
-      if (result.membership === 'MEMBER' || result.membership === 'joined') setSaved(true)
+      setMembershipRevision((value) => value + 1)
+      if (result.membership === 'MEMBER' || result.membership === 'joined') {
+        setSaved(true)
+      }
       else if (result.membership === 'REQUESTED' || result.membership === 'requested') setError('ส่งคำขอเข้าร่วมแล้ว ระบบจะยังไม่โพสต์จนกว่าแอดมินกลุ่มจะอนุมัติ')
       else setError('ยังตรวจไม่พบว่าเข้าร่วมกลุ่มแล้ว กรุณากดเข้าร่วมใน Facebook ให้เสร็จก่อน')
     } catch (e) { setError(e.message) }
@@ -249,8 +278,8 @@ export default function AutoCampaignPanel({ onOpenAccounts = () => {}, showSetti
         </div>
       </div>
 
-      <div className={showSettings ? '' : 'hidden'}><AccountPostingSettings campaign={campaign} accounts={accounts} sets={sets} groups={groups} onOpenAccounts={onOpenAccounts} onOpenGroupMembership={openGroupMembership} onGroupsSaved={setGroups} onChange={(next) => { setCampaign(next); setSaved(false) }} />
-      <div className="sticky bottom-3 z-20 flex items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white/95 p-4 shadow-lg"><span className="text-xs text-slate-500">ตั้งค่า {campaign.accountIds.length} บัญชี · บันทึกเพื่อใช้รายการและเวลาใหม่</span><button disabled={saving} className="rounded-xl bg-indigo-600 px-5 py-2.5 text-sm font-bold text-white disabled:opacity-50">{saving ? 'กำลังบันทึก…' : 'บันทึกการตั้งค่า'}</button></div>
+      <div className={showSettings ? '' : 'hidden'}><AccountPostingSettings campaign={campaign} accounts={accounts} sets={sets} groups={groups} onOpenAccounts={onOpenAccounts} onOpenGroupMembership={openGroupMembership} membershipRevision={membershipRevision} onGroupsSaved={setGroups} onChange={(next) => { setCampaign(next); setSaved(false) }} />
+      {showSettings && <p className="rounded-xl border border-indigo-100 bg-indigo-50 px-4 py-3 text-xs text-indigo-700">การเลือกทรัพย์และกลุ่มจะบันทึกเป็นคิวทันทีเมื่อกด “สร้างคิว” ไม่ต้องกดบันทึกการตั้งค่าอีก</p>}
       {saved && <p role="status" className="text-sm text-emerald-700">✓ บันทึกการตั้งค่าแล้ว</p>} </div>
 
       {showStats && <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/60 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowStats(false) }}>
@@ -313,13 +342,17 @@ export default function AutoCampaignPanel({ onOpenAccounts = () => {}, showSetti
           <div className="mt-3 space-y-2">
             {(runtime.plans || []).map((plan) => {
               const set = sets.find((item) => item.id === plan.nextPostSetId)
-              const activeRun = (runtime.runs || []).find((run) => run.accountId === plan.accountId && ['pending', 'posting'].includes(run.status))
+              const activeRun = plan.scheduleId
+                ? (runtime.runs || []).find((run) => run.id === plan.scheduleId)
+                : (runtime.runs || []).find((run) => run.accountId === plan.accountId && ['pending', 'posting'].includes(run.status))
               const activeSet = activeRun ? sets.find((item) => item.id === activeRun.postSetId) : null
               const displaySet = activeSet || set
-              return <div key={plan.accountId} className="flex items-center gap-3 rounded-xl border border-slate-100 bg-slate-50 p-2.5">
+              const propertyName = displaySet?.name || displaySet?.cd || displaySet?.propertyCode || activeRun?.name?.replace(/^อัตโนมัติ · /, '') || plan.nextPostSetName || (plan.state === 'inventory_empty' ? 'คิวหมด — ไม่มีห้องใหม่' : plan.randomPostSet ? 'สุ่มจากชุดโพสต์ทั้งหมด' : 'รอเลือกโพสต์')
+              const scheduledGroup = plan.group || activeRun?.groups?.[0]
+              return <div key={plan.scheduleId || plan.accountId} className="flex items-center gap-3 rounded-xl border border-slate-100 bg-slate-50 p-2.5">
                 {displaySet?.images?.[0]?.url ? <img src={displaySet.images[0].url} alt="" className="h-11 w-11 rounded-lg object-cover" /> : <div className="grid h-11 w-11 place-items-center rounded-lg bg-white">📝</div>}
-                <div className="min-w-0 flex-1"><p className="truncate text-sm font-bold text-slate-700">{activeRun?.name?.replace(/^อัตโนมัติ · /, '') || plan.nextPostSetName || (plan.state === 'inventory_empty' ? 'คิวหมด — ไม่มีห้องใหม่' : plan.randomPostSet ? 'สุ่มจากชุดโพสต์ทั้งหมด' : 'รอเลือกโพสต์')}</p><p className="text-[11px] text-slate-500">👤 {plan.accountName}</p></div>
-                <div className="shrink-0 text-right"><p className={`text-[11px] font-bold ${plan.state === 'inventory_empty' ? 'text-amber-600' : activeRun?.status === 'posting' ? 'text-amber-600' : 'text-indigo-600'}`}>{activeRun?.status === 'posting' ? '● กำลังโพสต์' : activeRun?.status === 'pending' ? 'อยู่ในคิว' : plan.state === 'inventory_empty' ? 'รอเพิ่มห้อง' : plan.state === 'completed' ? 'เสร็จแล้ว' : 'รอบถัดไป'}</p>{plan.nextRunAt && !activeRun && <p className="text-[10px] text-slate-400">{new Date(plan.nextRunAt).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })}</p>}</div>
+                <div className="min-w-0 flex-1"><p className="truncate text-sm font-bold text-slate-700">{propertyName}</p><p className="truncate text-[11px] text-slate-500">👤 {plan.accountName}{scheduledGroup && <> · 📁 {groupTitle(scheduledGroup, groups)}</>}</p></div>
+                  <div className="shrink-0 text-right"><p className={`text-[11px] font-bold ${plan.state === 'inventory_empty' ? 'text-amber-600' : activeRun?.status === 'posting' ? 'text-amber-600' : 'text-indigo-600'}`}>{activeRun?.status === 'posting' ? '● กำลังโพสต์' : activeRun?.status === 'pending' ? 'อยู่ในคิว' : plan.state === 'inventory_empty' ? 'รอเพิ่มห้อง' : plan.state === 'completed' ? 'เสร็จแล้ว' : 'รอบถัดไป'}</p>{plan.nextRunAt && <p className="text-[10px] text-slate-400">🕒 {new Date(plan.nextRunAt).toLocaleString('th-TH', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</p>}{plan.scheduleId && <button type="button" onClick={() => deleteQueuedCampaign(plan.scheduleId)} title="ลบคิว" className="mt-1 rounded px-1.5 py-0.5 text-[11px] font-bold text-rose-600 hover:bg-rose-50">ลบ</button>}</div>
               </div>
             })}
             {!(runtime.plans || []).length && <p className="py-6 text-center text-sm text-slate-400">เปิดระบบและเลือกบัญชีเพื่อสร้างแผนโพสต์</p>}

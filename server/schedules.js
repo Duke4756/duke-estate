@@ -49,7 +49,6 @@ function successfulPosts() {
 export function isVerifiedPostResult(result = {}) {
   return result.ok === true && (
     (result.verified === 'permalink' && Boolean(result.postUrl))
-    || (result.verified === 'group_card' && result.submitted === true)
     || (result.verified === 'facebook_api' && result.submitted === true && result.publishReceipt?.accepted === true)
   )
 }
@@ -107,7 +106,7 @@ export function scheduleStatusForResults(results = []) {
   const allOk = results.length > 0 && results.every(delivered)
   if (allOk) return 'done'
   if (results.some(delivered)) return 'done'
-  if (results.some((result) => result.pending || ['accepted', 'unconfirmed'].includes(result.verified))) return 'unconfirmed'
+  if (results.some((result) => result.pending || ['accepted', 'unconfirmed'].includes(result.verified) || (result.verified === 'group_card' && result.submitted === true))) return 'unconfirmed'
   return 'failed'
 }
 
@@ -189,7 +188,7 @@ export function updateSchedule(id, patch = {}) {
   const list = read()
   const i = list.findIndex((s) => s.id === id)
   if (i < 0) return null
-  for (const k of ['name', 'postSetId', 'groups', 'groupMode', 'accountId', 'runAt', 'status', 'results', 'lastRunAt', 'finishedAt', 'batchId', 'batchIndex', 'batchSize', 'source', 'autoCampaignId', 'ownerPromotionId', 'reusable', 'burstId', 'burstIndex', 'burstSize', 'manualOverride', 'autoRetryCount', 'autoRetryReason']) {
+  for (const k of ['name', 'postSetId', 'groups', 'groupMode', 'accountId', 'runAt', 'status', 'results', 'lastRunAt', 'finishedAt', 'batchId', 'batchIndex', 'batchSize', 'source', 'autoCampaignId', 'campaignId', 'campaignPlacementKey', 'cycle', 'ownerPromotionId', 'reusable', 'burstId', 'burstIndex', 'burstSize', 'manualOverride', 'autoRetryCount', 'autoRetryReason']) {
     if (k in patch) list[i][k] = k === 'groups' ? (patch[k] || []).filter(Boolean) : patch[k]
   }
   list[i].updatedAt = new Date().toISOString()
@@ -265,7 +264,7 @@ export function reclassifyUnverifiedAcceptedSchedules() {
   for (const schedule of list) {
     let scheduleChanged = false
     const results = (schedule.results || []).map((result) => {
-      if (!['accepted', 'submitted'].includes(result.verified)) return result
+      if (!['accepted', 'submitted', 'group_card'].includes(result.verified)) return result
       changed = true
       scheduleChanged = true
       return {

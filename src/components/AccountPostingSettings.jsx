@@ -1,12 +1,155 @@
-import { useState } from 'react'
-import { resolveGroupNames, saveGroups } from '../api'
-export function defaultAccountPlan(campaign, accountId) { const rule = campaign.accountRules?.[accountId] || {}; const slots = Array.isArray(rule.slots) ? rule.slots : (rule.postSetIds || []).flatMap((postSetId) => (rule.groups || []).map((group) => ({ postSetId, group, time: rule.time || '09:00' }))); return { slots, startDate: rule.startDate || new Date(Date.now() + 7 * 3600000).toISOString().slice(0, 10), repeatDaily: rule.repeatDaily === true } }
-const names = { general: 'ทั่วไป', owner: 'เจ้าของ', pet: 'สัตว์เลี้ยง', house: 'บ้าน', sale: 'ซื้อ / ขาย' }; const label = (v) => names[v] || v || 'ทั่วไป'; const cls = 'mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-indigo-500'
-const selectedMark = (id, slots) => slots.some((slot) => slot.postSetId === id) ? '✓ ' : '○ '
-export default function AccountPostingSettings({ campaign, accounts, sets, groups, onChange, onOpenAccounts, onOpenGroupMembership, onGroupsSaved }) {
-  const ready = accounts.filter((a) => a.ready); const [activeId, setActiveId] = useState(null); const account = ready.find((a) => a.id === activeId) || ready[0]; const [property, setProperty] = useState('condo'); const [deal, setDeal] = useState('rent'); const [category, setCategory] = useState('all'); const [search, setSearch] = useState(''); const [busy, setBusy] = useState(false)
-  if (!account) return <section className="rounded-2xl border bg-white p-6"><p>ยังไม่มีบัญชีที่ล็อกอินพร้อมโพสต์</p><button type="button" onClick={onOpenAccounts} className="mt-3 font-bold text-indigo-600">จัดการบัญชีและล็อกอิน</button></section>
-  const rule = defaultAccountPlan(campaign, account.id); const update = (patch) => onChange({ ...campaign, mode: 'account_schedule', accountRules: { ...campaign.accountRules, [account.id]: { ...rule, ...patch } } }); const stock = sets.filter((s) => (s.deal || 'rent') === deal && (s.kind || 'condo') === property).map((s) => ({ ...s, name: `${selectedMark(s.id, rule.slots)}${s.name}` })); const categories = [...new Set(['general', 'owner', 'pet', 'house', 'sale', ...groups.map((g) => g.category || 'general')])]; const visible = groups.filter((g) => (category === 'all' || (g.category || 'general') === category) && `${g.name || g.label || ''} ${g.url}`.toLowerCase().includes(search.toLowerCase())); const updateSlot = (i, patch) => update({ slots: rule.slots.map((s, n) => n === i ? { ...s, ...patch } : s) }); const addSlot = () => update({ slots: [...rule.slots, { postSetId: stock[0]?.id || '', group: visible[0]?.url || groups[0]?.url || '', times: ['09:00'] }] });
-  async function refreshNames() { setBusy(true); try { const result = await resolveGroupNames(groups.map((g) => g.url)); onGroupsSaved?.(result.groups || groups) } catch { /* keep names */ } finally { setBusy(false) } }
-  return <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm"><header className="border-b p-5"><h2 className="text-lg font-bold">ตั้งค่าโพสต์รายบัญชี</h2><p className="mt-1 text-sm text-slate-500">หนึ่งรายการเลือกเวลาโพสต์ได้หลายเวลา</p></header><div className="flex gap-2 border-b bg-slate-50 p-3">{ready.map((a) => <button type="button" key={a.id} onClick={() => setActiveId(a.id)} className={`rounded-xl px-4 py-2.5 text-sm font-semibold ${a.id === account.id ? 'bg-indigo-600 text-white' : 'bg-white'}`}>{a.name}</button>)}</div><div className="p-4 sm:p-6"><label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={campaign.accountIds.includes(account.id)} onChange={() => onChange({ ...campaign, accountIds: campaign.accountIds.includes(account.id) ? campaign.accountIds.filter((id) => id !== account.id) : [...campaign.accountIds, account.id] })} /> ใช้งานบัญชีนี้</label><div className="mt-5 flex flex-wrap gap-2"><button type="button" onClick={() => setProperty('condo')} className={`rounded-lg px-3 py-1.5 font-bold ${property === 'condo' ? 'bg-indigo-600 text-white' : 'bg-slate-100'}`}>คอนโด</button><button type="button" onClick={() => setProperty('house')} className={`rounded-lg px-3 py-1.5 font-bold ${property === 'house' ? 'bg-indigo-600 text-white' : 'bg-slate-100'}`}>บ้าน</button><button type="button" onClick={() => setDeal('rent')} className={`rounded-lg px-3 py-1.5 font-bold ${deal === 'rent' ? 'bg-emerald-600 text-white' : 'bg-slate-100'}`}>เช่า</button><button type="button" onClick={() => setDeal('sale')} className={`rounded-lg px-3 py-1.5 font-bold ${deal === 'sale' ? 'bg-emerald-600 text-white' : 'bg-slate-100'}`}>ขาย</button></div><div className="mt-3 flex flex-wrap gap-1.5"><span className="self-center text-xs font-bold">หมวดกลุ่ม:</span>{categories.map((c) => <button type="button" key={c} onClick={() => setCategory(c)} className={`rounded-lg px-3 py-1.5 text-xs font-bold ${category === c ? 'bg-indigo-600 text-white' : 'bg-slate-100'}`}>{label(c)} · {groups.filter((g) => (g.category || 'general') === c).length}</button>)}<button type="button" onClick={refreshNames} disabled={busy} className="rounded-lg border px-3 py-1.5 text-xs font-bold text-indigo-700">{busy ? 'กำลังดึงชื่อ…' : '↻ อัปเดตชื่อกลุ่ม'}</button></div><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="ค้นหาชื่อกลุ่มในหมวดที่เลือก…" className="mt-3 w-full rounded-xl border px-3 py-2" />{rule.slots.map((slot, i) => <div key={`${i}-${slot.postSetId}`} className="mt-3 rounded-2xl border bg-slate-50 p-3"><div className="grid gap-3 md:grid-cols-[1fr_1fr_1fr_auto]"><label className="text-xs font-semibold">ทรัพย์<select value={slot.postSetId} onChange={(e) => updateSlot(i, { postSetId: e.target.value })} className={cls}>{stock.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}</select></label><label className="text-xs font-semibold">กลุ่ม<select value={slot.group} onChange={(e) => updateSlot(i, { group: e.target.value })} className={cls}>{visible.map((g) => <option key={g.url} value={g.url}>{g.name || g.label || g.url} · {label(g.category)}</option>)}</select><button type="button" onClick={() => onOpenGroupMembership?.({ accountId: account.id, accountName: account.name, group: slot.group })} className="mt-1 text-[11px] font-bold text-emerald-600">ตรวจสมาชิกบัญชีนี้</button></label><div><span className="text-xs font-semibold">เวลาโพสต์</span>{(slot.times || [slot.time || '09:00']).map((time, n) => <div key={n} className="mt-1 flex gap-1"><input type="time" value={time} onChange={(e) => updateSlot(i, { times: (slot.times || [slot.time || '09:00']).map((t, j) => j === n ? e.target.value : t) })} className={cls} />{n > 0 && <button type="button" onClick={() => updateSlot(i, { times: (slot.times || []).filter((_, j) => j !== n) })} className="px-2 text-rose-600">×</button>}</div>)}<button type="button" onClick={() => updateSlot(i, { times: [...(slot.times || [slot.time || '09:00']), '12:00'] })} className="mt-1 text-[11px] font-bold text-indigo-600">＋ เพิ่มเวลา</button></div><button type="button" onClick={() => update({ slots: rule.slots.filter((_, n) => n !== i) })} className="self-end text-xs font-bold text-rose-600">ลบ</button></div></div>)}<button type="button" onClick={addSlot} disabled={!stock.length || !groups.length} className="mt-3 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-bold text-white disabled:opacity-40">＋ เพิ่มโพสต์เฉพาะ</button><div className="mt-6 border-t pt-5"><label className="text-xs font-semibold">วันที่เริ่ม<input type="date" value={rule.startDate} onChange={(e) => update({ startDate: e.target.value })} className={cls} /></label><label className="mt-4 flex gap-2 text-sm"><input type="checkbox" checked={rule.repeatDaily} onChange={(e) => update({ repeatDaily: e.target.checked })} /> ทำรายการโพสต์ชุดนี้ซ้ำทุกวัน</label></div></div></section>
+import { useEffect, useMemo, useState } from 'react'
+import { getCampaignGroups, startCampaignEngine } from '../api'
+
+export function defaultAccountPlan(campaign, accountId) {
+  const existing = campaign.accountRules?.[accountId] || {}
+  // The legacy account-schedule save action still validates a posting date,
+  // even though this screen creates campaign queues automatically. Supply a
+  // safe Bangkok date for old rules that do not yet have one.
+  const tomorrowBangkok = new Date(Date.now() + (31 * 60 * 60 * 1000)).toISOString().slice(0, 10)
+  return { ...existing, startDate: existing.startDate || tomorrowBangkok, slots: [] }
+}
+
+function groupTitle(group) {
+  return group.name || group.label || group.url.replace(/^https?:\/\/(?:www\.)?facebook\.com\/groups\//, '').replace(/\/$/, '')
+}
+
+export default function AccountPostingSettings({ campaign, accounts = [], sets = [], groups = [], onOpenAccounts, onOpenGroupMembership = () => {}, membershipRevision = 0 }) {
+  const availableAccounts = accounts.filter((account) => account.ready === true)
+  const [activeId, setActiveId] = useState(availableAccounts[0]?.id || '')
+  const [query, setQuery] = useState('')
+  const [showProperties, setShowProperties] = useState(false)
+  const [selected, setSelected] = useState([])
+  const [selectedGroupUrls, setSelectedGroupUrls] = useState([])
+  const [accountGroups, setAccountGroups] = useState([])
+  const [groupsLoading, setGroupsLoading] = useState(false)
+  const [groupCategory, setGroupCategory] = useState('ALL')
+  const [groupZone, setGroupZone] = useState('ALL')
+  const [type, setType] = useState('ALL')
+  const [deal, setDeal] = useState('ALL')
+  const [rounds, setRounds] = useState(1)
+  const [result, setResult] = useState(null)
+  const [busy, setBusy] = useState(false)
+
+  const active = availableAccounts.find((account) => account.id === activeId) || availableAccounts[0]
+  useEffect(() => {
+    let cancelled = false
+    setSelectedGroupUrls([])
+    if (!active?.id) { setAccountGroups([]); return undefined }
+    setGroupsLoading(true)
+    getCampaignGroups(active.id)
+      .then((response) => {
+        if (cancelled) return
+        setAccountGroups(response.groups || [])
+      })
+      .catch(() => { if (!cancelled) setAccountGroups([]) })
+      .finally(() => { if (!cancelled) setGroupsLoading(false) })
+    return () => { cancelled = true }
+  }, [active?.id, membershipRevision])
+  const visibleSets = sets.filter((set) => {
+    const text = `${set.cd || ''} ${set.propertyCode || ''} ${set.name || ''} ${set.project || set.projectName || ''}`.toLowerCase()
+    const kind = String(set.kind || set.category || '').toUpperCase()
+    const sale = String(set.deal || '').toUpperCase()
+    return (!query.trim() || text.includes(query.toLowerCase().trim())) && (type === 'ALL' || kind === type) && (deal === 'ALL' || sale === deal)
+  })
+  // Keep the shared library visible even if the per-account membership check
+  // is temporarily unavailable. It avoids presenting an empty picker simply
+  // because Facebook was slow to answer; UNKNOWN groups stay unselectable.
+  const displayGroups = accountGroups.length ? accountGroups : groups
+  const visibleGroups = useMemo(() => displayGroups.filter((group) => {
+    const category = String(group.category || '').toUpperCase()
+    return group.active !== false &&
+      (groupCategory === 'ALL' || category === groupCategory) &&
+      (groupZone === 'ALL' || (group.zone_tags || []).includes(groupZone))
+  }), [displayGroups, groupCategory, groupZone])
+  const zones = useMemo(() => [...new Set(displayGroups.flatMap((group) => group.zone_tags || []))].sort(), [displayGroups])
+
+  function toggleProperty(id) {
+    setSelected((ids) => ids.includes(id) ? ids.filter((value) => value !== id) : [...ids, id])
+    setResult(null)
+  }
+  function toggleGroup(url) {
+    setSelectedGroupUrls((urls) => urls.includes(url) ? urls.filter((value) => value !== url) : [...urls, url])
+    setResult(null)
+  }
+  async function createQueue() {
+    if (!active || !selected.length) return
+    setBusy(true)
+    try {
+      const properties = selected.map((id) => {
+        const set = sets.find((item) => item.id === id)
+        return { ...set, cd: set?.cd || set?.propertyCode || set?.name, postSetId: id, category: set?.kind || 'CONDO' }
+      })
+      const planType = selected.length > 1 && selectedGroupUrls.length === 1 ? 'MULTI_PROPERTY_ONE_GROUP' : 'ONE_PROPERTY_MULTI_GROUP'
+      const response = await startCampaignEngine({
+        campaignId: `account-${active.id}`,
+        accountId: active.id,
+        planType,
+        properties,
+        targetGroupUrls: selectedGroupUrls,
+        selectedZone: 'AUTO',
+        mode: 'ROTATE',
+        rounds: Math.max(1, Number(rounds) || 1),
+        gapMinutes: campaign.accountGapMinutes || 65,
+      })
+      setResult(response)
+      if (response.membershipResults?.length) {
+        getCampaignGroups(active.id)
+          .then((refreshed) => setAccountGroups(refreshed.groups || []))
+          .catch(() => {})
+      }
+    } catch (error) {
+      setResult({ error: error.message })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <section className="space-y-4">
+    <header className="rounded-2xl border border-slate-200 bg-white p-5">
+      <h2 className="text-xl font-black">ตั้งค่าการตลาดตามบัญชี</h2>
+      <p className="mt-1 text-sm text-slate-500">เลือกทรัพย์ เลือกกลุ่ม แล้วให้ระบบจัดคิวที่ปลอดภัย</p>
+      {availableAccounts.length > 0 && <div className="mt-4 flex flex-wrap gap-2">
+        {availableAccounts.map((account) => <button key={account.id} type="button" onClick={() => { setActiveId(account.id); setResult(null) }} className={`rounded-lg px-3 py-2 text-sm font-bold ${active?.id === account.id ? 'bg-violet-600 text-white' : 'bg-slate-100 text-slate-700'}`}>{account.name}</button>)}
+      </div>}
+      {!availableAccounts.length && <button type="button" onClick={onOpenAccounts} className="mt-3 font-bold text-violet-600">จัดการบัญชีและล็อกอิน</button>}
+    </header>
+
+    <section className="rounded-2xl border border-violet-200 bg-violet-50/40 p-5">
+      <p className="text-sm font-bold text-slate-900">1. เลือกทรัพย์</p>
+      <div className="mt-2 flex gap-2">
+        <input value={query} onFocus={() => setShowProperties(true)} onChange={(event) => { setQuery(event.target.value); setShowProperties(true) }} placeholder="ค้นหาด้วย CD หรือชื่อโครงการ…" className="min-w-0 flex-1 rounded-l-xl border bg-white px-3 py-2" />
+        <button type="button" onClick={() => setShowProperties((value) => !value)} className="rounded-r-xl border border-l-0 bg-white px-3" aria-label="แสดงรายการทรัพย์">⌄</button>
+        <select value={type} onChange={(event) => setType(event.target.value)} className="rounded-xl border bg-white px-2"><option value="ALL">ทั้งหมด</option><option value="CONDO">คอนโด</option><option value="HOUSE">บ้าน</option></select>
+        <select value={deal} onChange={(event) => setDeal(event.target.value)} className="rounded-xl border bg-white px-2"><option value="ALL">เช่า/ขาย</option><option value="RENT">เช่า</option><option value="SALE">ขาย</option></select>
+      </div>
+      {showProperties && <div className="mt-2 max-h-40 overflow-auto rounded-xl border bg-white p-2">{visibleSets.map((set) => <button key={set.id} type="button" onClick={() => toggleProperty(set.id)} className={`mr-2 mb-2 rounded-lg border px-3 py-2 text-xs font-semibold ${selected.includes(set.id) ? 'border-violet-600 bg-violet-600 text-white' : 'bg-white'}`}>{selected.includes(set.id) ? '✓ ' : ''}<b>{set.cd || set.propertyCode || ''}</b> {set.project || set.projectName || set.name}</button>)}{!visibleSets.length && <p className="p-2 text-sm text-slate-400">ไม่พบทรัพย์ที่ค้นหา</p>}</div>}
+      {selected.length > 0 && <p className="mt-2 text-xs font-bold text-violet-700">เลือกทรัพย์แล้ว {selected.length} รายการ</p>}
+    </section>
+
+    <section className="rounded-2xl border border-slate-200 bg-white p-5">
+      <div className="flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-bold text-slate-900">2. เลือกกลุ่ม</p><span className="text-xs text-slate-500">เลือกได้เฉพาะกลุ่มที่เข้าร่วมแล้ว · ไม่เลือก = ระบบเลือกอัตโนมัติ</span></div>
+      <div className="mt-2 flex flex-wrap gap-2">
+        <select value={groupCategory} onChange={(event) => setGroupCategory(event.target.value)} className="rounded-lg border px-2 py-1.5 text-sm"><option value="ALL">ทุกหมวด</option><option value="CONDO">คอนโด</option><option value="HOUSE">บ้าน</option><option value="MIXED">ใช้ได้ทั้งคู่</option></select>
+        <select value={groupZone} onChange={(event) => setGroupZone(event.target.value)} className="rounded-lg border px-2 py-1.5 text-sm"><option value="ALL">ทุกโซน</option>{zones.map((zone) => <option key={zone} value={zone}>{zone}</option>)}</select>
+        <span className="self-center text-xs font-medium text-violet-700">เลือก {selectedGroupUrls.length} กลุ่ม</span>
+      </div>
+      <div className="mt-2 max-h-40 overflow-auto rounded-xl border bg-slate-50 p-2">{visibleGroups.map((group) => {
+        const isMember = group.membership === 'MEMBER'
+        const requested = group.membership === 'REQUESTED'
+        const notMember = group.membership === 'NOT_MEMBER'
+        const canSelect = !requested && !notMember
+        return <div key={group.url} className="mr-2 mb-2 inline-flex max-w-full items-center gap-1 rounded-lg border bg-white p-1 text-left text-xs">
+          <button type="button" disabled={!canSelect} onClick={() => toggleGroup(group.url)} className={`inline-flex min-w-0 items-center gap-1 rounded-md px-2 py-1.5 disabled:cursor-default ${selectedGroupUrls.includes(group.url) ? 'bg-violet-600 text-white' : ''}`}><span>{selectedGroupUrls.includes(group.url) ? '✓' : '○'}</span><span className="truncate">{groupTitle(group)}</span><span className="opacity-70">· {group.category}{group.zone_tags?.length ? ` · ${group.zone_tags.join(', ')}` : ''}</span></button>
+          {isMember ? <span className="px-1 text-[10px] font-bold text-emerald-600">เข้าร่วมแล้ว</span> : requested ? <span className="px-1 text-[10px] font-bold text-amber-600">รออนุมัติ</span> : notMember ? <button type="button" onClick={() => onOpenGroupMembership({ accountId: active.id, accountName: active.name, group: group.url })} className="rounded-md bg-violet-600 px-2 py-1.5 text-[10px] font-bold text-white hover:bg-violet-700">เข้าร่วม</button> : <span className="px-1 text-[10px] font-medium text-slate-400">ตรวจสอบไม่ได้</span>}
+        </div>
+      })}{groupsLoading && <p className="p-2 text-sm text-slate-400">กำลังตรวจสถานะสมาชิกของบัญชี…</p>}{!groupsLoading && !visibleGroups.length && <p className="p-2 text-sm text-slate-400">ยังไม่มีกลุ่มในคลัง กรุณาเพิ่มกลุ่มก่อน</p>}</div>
+    </section>
+
+    <section className="rounded-2xl border border-slate-200 bg-white p-5">
+      <label className="block max-w-xs text-sm font-bold">จำนวนคิวต่อทรัพย์<input type="number" min="1" max="20" value={rounds} onChange={(event) => { setRounds(Math.max(1, Number(event.target.value) || 1)); setResult(null) }} className="mt-1 w-full rounded-xl border px-3 py-2" /><span className="mt-1 block text-xs font-normal text-slate-500">แต่ละทรัพย์จะถูกวางคิวตามจำนวนนี้ โดยหมุนในกลุ่มที่เลือก</span></label>
+      <button type="button" disabled={busy || !selected.length || !active} onClick={createQueue} className="mt-4 rounded-xl bg-violet-600 px-4 py-2 font-bold text-white disabled:opacity-50">{busy ? 'กำลังสร้างคิว…' : 'สร้างคิว'}</button>
+      {result && <div className={`mt-3 rounded-xl p-3 text-sm ${result.error || (!result.schedules?.length && result.membershipResults?.some((item) => item.membership !== 'MEMBER')) ? 'bg-rose-50 text-rose-700' : 'bg-emerald-50 text-emerald-700'}`}>{result.error || (result.schedules?.length ? `✓ สร้างคิวแล้ว ${result.schedules.length} รายการ · ดูได้ที่ Monitor` : result.alreadyQueued ? `✓ รายการนี้มีคิวอยู่แล้ว ${result.alreadyQueued} งาน` : result.membershipResults?.some((item) => item.membership === 'NOT_MEMBER') ? 'กลุ่มที่เลือกมีบัญชีที่ยังไม่ได้เข้าร่วม — กด “เข้าร่วม” ที่กลุ่มนั้นก่อนสร้างคิวใหม่' : result.membershipResults?.some((item) => item.membership === 'REQUESTED') ? 'กลุ่มที่เลือกกำลังรออนุมัติ จึงยังสร้างคิวไม่ได้' : '⚠ ยังตรวจสอบการเป็นสมาชิกกลุ่มไม่สำเร็จ กรุณาลองใหม่')}</div>}
+    </section>
+  </section>
 }

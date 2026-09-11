@@ -12,7 +12,8 @@ export async function detectGroupMembership(page) {
   const visible = async (locator) => {
     try { return (await locator.count()) > 0 && await locator.first().isVisible().catch(() => false) } catch { return false }
   }
-  if (await visible(page.getByText(/^(เข้าร่วมแล้ว|Joined)$/i))) return 'MEMBER'
+  if (await visible(page.getByText(/^(เข้าร่วมแล้ว|Joined|สมาชิก|Member)$/i))) return 'MEMBER'
+  if (await visible(page.getByRole('button', { name: /^(เข้าร่วมแล้ว|Joined|จัดการการเป็นสมาชิก|Manage membership)$/i }))) return 'MEMBER'
   if (await visible(page.getByRole('button', { name: /^(ยกเลิกคำขอ|Cancel request)$/i }))) return 'REQUESTED'
   if (await visible(page.getByText(/^(รอการอนุมัติ|Pending)$/i))) return 'REQUESTED'
   if (await visible(page.getByRole('button', { name: /^(เข้าร่วมกลุ่ม|Join group)$/i }))) return 'NOT_MEMBER'
